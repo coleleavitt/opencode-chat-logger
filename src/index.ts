@@ -25,6 +25,7 @@ import { extractEntitiesAndRelations } from "./entities";
 import {
   runConsolidationPass,
   runTierPromotion,
+  runSessionEndConsolidation,
   getConsolidationStats,
 } from "./consolidation";
 import { extractFactsWithContext, checkFactSupersession } from "./facts";
@@ -2135,8 +2136,7 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
           `Session with ${messages.length} messages. Topics: ${relevantMemories.map((m) => m.memory.sector).join(", ")}`,
         );
 
-        // runConsolidationPass(db, 5);
-        runTierPromotion(db, 10);
+        runSessionEndConsolidation(db);
       } catch {}
     },
   };

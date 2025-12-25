@@ -1,4 +1,4 @@
-import type { ChatLoggerDb, DbMemory, Sector } from "./db";
+import type { ChatLoggerDb, DbMemory } from "./db";
 import { cosineSimilarity } from "./embedding";
 
 export interface ConsolidationResult {
@@ -12,53 +12,31 @@ export interface SimilarMemoryPair {
   memory1: DbMemory;
   memory2: DbMemory;
   similarity: number;
+  sharedEntities: number;
 }
 
-const SIMILARITY_THRESHOLD = 0.85;
-const MIN_AGE_HOURS = 24;
-
-function getMemoryAge(memory: DbMemory): number {
-  const created = new Date(memory.created_at).getTime();
-  const now = Date.now();
-  return (now - created) / (1000 * 60 * 60);
-}
-
-function mergeMemoryContent(m1: DbMemory, m2: DbMemory): string {
-  if (m1.content === m2.content) return m1.content;
-
-  const newer = new Date(m1.created_at) > new Date(m2.created_at) ? m1 : m2;
-  const older = newer === m1 ? m2 : m1;
-
-  if (newer.content.includes(older.content)) return newer.content;
-  if (older.content.includes(newer.content)) return older.content;
-
-  return newer.content.length > older.content.length
-    ? newer.content
-    : older.content;
-}
+const SIMILARITY_THRESHOLD = 0.75;
 
 function combineSalience(m1: DbMemory, m2: DbMemory): number {
   return Math.min(Math.max(m1.salience, m2.salience) * 1.1, 1.0);
 }
 
-function selectSector(m1: DbMemory, m2: DbMemory): Sector {
-  const sectorPriority: Record<Sector, number> = {
-    architecture: 5,
-    code_change: 4,
-    debugging: 3,
-    procedural: 2,
-    discussion: 1,
-    emotional: 0,
-  };
+function countSharedEntities(
+  db: ChatLoggerDb,
+  m1Id: string,
+  m2Id: string,
+): number {
+  const entities1 = db.getEntitiesInMemory(m1Id);
+  const entities2 = db.getEntitiesInMemory(m2Id);
 
-  return sectorPriority[m1.sector] >= sectorPriority[m2.sector]
-    ? m1.sector
-    : m2.sector;
+  const ids1 = new Set(entities1.map((e) => e.id));
+  return entities2.filter((e) => ids1.has(e.id)).length;
 }
 
 export function findSimilarMemories(
   db: ChatLoggerDb,
   threshold: number = SIMILARITY_THRESHOLD,
+  requireEntityOverlap: boolean = false,
 ): SimilarMemoryPair[] {
   const pairs: SimilarMemoryPair[] = [];
   const memories = db.getUnconsolidatedMemories(500);
@@ -75,6 +53,8 @@ export function findSimilarMemories(
       const m1 = memoriesWithVectors[i];
       const m2 = memoriesWithVectors[j];
 
+      if (m1.memory.sector !== m2.memory.sector) continue;
+
       let maxSimilarity = 0;
       for (const v1 of m1.vectors) {
         for (const v2 of m2.vectors) {
@@ -83,17 +63,30 @@ export function findSimilarMemories(
         }
       }
 
-      if (maxSimilarity >= threshold) {
-        pairs.push({
-          memory1: m1.memory,
-          memory2: m2.memory,
-          similarity: maxSimilarity,
-        });
-      }
+      if (maxSimilarity < threshold) continue;
+
+      const sharedEntities = countSharedEntities(
+        db,
+        m1.memory.id,
+        m2.memory.id,
+      );
+
+      if (requireEntityOverlap && sharedEntities === 0) continue;
+
+      pairs.push({
+        memory1: m1.memory,
+        memory2: m2.memory,
+        similarity: maxSimilarity,
+        sharedEntities,
+      });
     }
   }
 
-  return pairs.sort((a, b) => b.similarity - a.similarity);
+  return pairs.sort((a, b) => {
+    const scoreA = a.similarity + a.sharedEntities * 0.1;
+    const scoreB = b.similarity + b.sharedEntities * 0.1;
+    return scoreB - scoreA;
+  });
 }
 
 export function consolidateMemoryPair(
@@ -102,14 +95,7 @@ export function consolidateMemoryPair(
 ): string | null {
   const { memory1, memory2 } = pair;
 
-  const age1 = getMemoryAge(memory1);
-  const age2 = getMemoryAge(memory2);
-  if (age1 < MIN_AGE_HOURS && age2 < MIN_AGE_HOURS) {
-    return null;
-  }
-
   const mergedSalience = combineSalience(memory1, memory2);
-
   const newer = new Date(memory1.created_at) > new Date(memory2.created_at);
   const keepMemory = newer ? memory1 : memory2;
   const deleteMemory = newer ? memory2 : memory1;
@@ -123,7 +109,7 @@ export function consolidateMemoryPair(
     action: "merge",
     source_ids: [memory1.id, memory2.id],
     result_id: keepMemory.id,
-    reason: `Merged similar memories (similarity: ${pair.similarity.toFixed(3)})`,
+    reason: `Merged (similarity: ${pair.similarity.toFixed(3)}, shared entities: ${pair.sharedEntities})`,
   });
 
   return keepMemory.id;
@@ -140,7 +126,7 @@ export function runConsolidationPass(
     created: 0,
   };
 
-  const pairs = findSimilarMemories(db);
+  const pairs = findSimilarMemories(db, SIMILARITY_THRESHOLD, false);
   const processedIds = new Set<string>();
 
   for (const pair of pairs) {
@@ -172,7 +158,7 @@ export function getConsolidationStats(db: ChatLoggerDb): {
   const unconsolidated = db.getUnconsolidatedMemories(1000).length;
   const logs = db.getConsolidationLogs(100);
   const consolidated = logs.filter((l) => l.action === "merge").length;
-  const potentialMerges = findSimilarMemories(db, 0.8).length;
+  const potentialMerges = findSimilarMemories(db, 0.75, false).length;
 
   return { unconsolidated, consolidated, potentialMerges };
 }
@@ -181,19 +167,6 @@ export interface TierPromotionResult {
   sessionToProject: number;
   projectToPersonal: number;
 }
-
-const TIER_PROMOTION_THRESHOLDS = {
-  sessionToProject: {
-    minAccessCount: 3,
-    minSalience: 0.4,
-    minCrossSessionCount: 2,
-  },
-  projectToPersonal: {
-    minAccessCount: 5,
-    minSalience: 0.6,
-    minCrossSessionCount: 3,
-  },
-};
 
 export function runTierPromotion(
   db: ChatLoggerDb,
@@ -204,57 +177,51 @@ export function runTierPromotion(
     projectToPersonal: 0,
   };
 
-  const sessionCandidates = db.getPromotionCandidates(
-    "session",
-    TIER_PROMOTION_THRESHOLDS.sessionToProject.minAccessCount,
-    TIER_PROMOTION_THRESHOLDS.sessionToProject.minSalience,
-    maxPromotions,
-  );
+  const sessionMemories = db.getMemoriesByTier("session", 200);
 
-  for (const memory of sessionCandidates) {
+  for (const memory of sessionMemories) {
     if (result.sessionToProject >= maxPromotions / 2) break;
 
     const crossSessionCount = db.getCrossSessionMemoryCount(memory.content);
-    if (
-      crossSessionCount >=
-      TIER_PROMOTION_THRESHOLDS.sessionToProject.minCrossSessionCount
-    ) {
+    if (crossSessionCount >= 2) {
       db.promoteMemoryTier(memory.id, "project");
       db.logConsolidation({
         action: "update",
         source_ids: [memory.id],
         result_id: memory.id,
-        reason: `Promoted session→project (access=${memory.access_count}, salience=${memory.salience.toFixed(2)}, cross-session=${crossSessionCount})`,
+        reason: `Promoted session→project (cross-session=${crossSessionCount})`,
       });
       result.sessionToProject++;
     }
   }
 
-  const projectCandidates = db.getPromotionCandidates(
-    "project",
-    TIER_PROMOTION_THRESHOLDS.projectToPersonal.minAccessCount,
-    TIER_PROMOTION_THRESHOLDS.projectToPersonal.minSalience,
-    maxPromotions,
-  );
+  const projectMemories = db.getMemoriesByTier("project", 200);
 
-  for (const memory of projectCandidates) {
+  for (const memory of projectMemories) {
     if (result.projectToPersonal >= maxPromotions / 2) break;
 
-    const crossSessionCount = db.getCrossSessionMemoryCount(memory.content);
-    if (
-      crossSessionCount >=
-      TIER_PROMOTION_THRESHOLDS.projectToPersonal.minCrossSessionCount
-    ) {
+    const effectiveSalience = db.getDecayedSalience(memory);
+    if (effectiveSalience > 0.7) {
       db.promoteMemoryTier(memory.id, "personal");
       db.logConsolidation({
         action: "update",
         source_ids: [memory.id],
         result_id: memory.id,
-        reason: `Promoted project→personal (access=${memory.access_count}, salience=${memory.salience.toFixed(2)}, cross-session=${crossSessionCount})`,
+        reason: `Promoted project→personal (effective salience=${effectiveSalience.toFixed(2)})`,
       });
       result.projectToPersonal++;
     }
   }
 
   return result;
+}
+
+export function runSessionEndConsolidation(db: ChatLoggerDb): {
+  consolidation: ConsolidationResult;
+  promotion: TierPromotionResult;
+} {
+  const consolidation = runConsolidationPass(db, 20);
+  const promotion = runTierPromotion(db, 20);
+
+  return { consolidation, promotion };
 }
