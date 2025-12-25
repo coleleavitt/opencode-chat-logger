@@ -1070,6 +1070,126 @@ export class ChatLoggerDb {
     stmt.run(validTo ?? null, factId);
   }
 
+  findRelatedFacts(
+    content: string,
+    sector: Sector,
+    limit: number = 10,
+  ): DbFact[] {
+    const words = content
+      .toLowerCase()
+      .replace(/[^\w\s]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length > 3);
+
+    if (words.length === 0) return [];
+
+    const searchTerms = words.slice(0, 5).join(" OR ");
+
+    const stmt = this.db.prepare(`
+      SELECT f.* FROM facts_fts
+      JOIN facts f ON facts_fts.rowid = f.rowid
+      WHERE facts_fts MATCH ? AND f.is_current = 1 AND f.sector = ?
+      ORDER BY bm25(facts_fts)
+      LIMIT ?
+    `);
+
+    try {
+      return stmt.all(searchTerms, sector, limit) as DbFact[];
+    } catch {
+      return [];
+    }
+  }
+
+  supersedeFact(oldFactId: string, newFactId: string, reason: string): void {
+    this.invalidateFact(oldFactId);
+    this.logConsolidation({
+      action: "update",
+      source_ids: [oldFactId],
+      result_id: newFactId,
+      reason: `Superseded: ${reason}`,
+    });
+  }
+
+  promoteMemoryTier(memoryId: string, newTier: MemoryTier): void {
+    const stmt = this.db.prepare(`
+      UPDATE memories SET tier = ? WHERE id = ?
+    `);
+    stmt.run(newTier, memoryId);
+  }
+
+  getMemoriesByTier(tier: MemoryTier, limit: number = 100): DbMemory[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM memories WHERE tier = ? ORDER BY salience DESC LIMIT ?
+    `);
+    return stmt.all(tier, limit) as DbMemory[];
+  }
+
+  getPromotionCandidates(
+    fromTier: MemoryTier,
+    minAccessCount: number = 3,
+    minSalience: number = 0.5,
+    limit: number = 50,
+  ): DbMemory[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM memories 
+      WHERE tier = ? 
+        AND access_count >= ? 
+        AND salience >= ?
+        AND is_consolidated = 0
+      ORDER BY salience DESC, access_count DESC
+      LIMIT ?
+    `);
+    return stmt.all(fromTier, minAccessCount, minSalience, limit) as DbMemory[];
+  }
+
+  getProjectMemories(directory: string, limit: number = 100): DbMemory[] {
+    const stmt = this.db.prepare(`
+      SELECT m.* FROM memories m
+      JOIN sessions s ON m.session_id = s.id
+      WHERE s.directory = ? AND m.tier IN ('project', 'personal')
+      ORDER BY m.salience DESC
+      LIMIT ?
+    `);
+    return stmt.all(directory, limit) as DbMemory[];
+  }
+
+  getPersonalMemories(limit: number = 100): DbMemory[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM memories WHERE tier = 'personal' ORDER BY salience DESC LIMIT ?
+    `);
+    return stmt.all(limit) as DbMemory[];
+  }
+
+  getCrossSessionMemoryCount(
+    content: string,
+    minSimilarityWords: number = 3,
+  ): number {
+    const words = content
+      .toLowerCase()
+      .replace(/[^\w\s]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length > 3)
+      .slice(0, 5);
+
+    if (words.length < minSimilarityWords) return 0;
+
+    const searchTerms = words.join(" OR ");
+
+    const stmt = this.db.prepare(`
+      SELECT COUNT(DISTINCT m.session_id) as session_count
+      FROM memories_fts
+      JOIN memories m ON memories_fts.rowid = m.rowid
+      WHERE memories_fts MATCH ?
+    `);
+
+    try {
+      const result = stmt.get(searchTerms) as { session_count: number } | null;
+      return result?.session_count || 0;
+    } catch {
+      return 0;
+    }
+  }
+
   logConsolidation(log: {
     action: "merge" | "update" | "delete" | "create";
     source_ids: string[];

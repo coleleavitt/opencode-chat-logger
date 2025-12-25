@@ -22,8 +22,12 @@ import {
 } from "./scoring";
 import { createWaypointsForMemory, traverseFromMemory } from "./graph";
 import { extractEntitiesAndRelations } from "./entities";
-import { runConsolidationPass } from "./consolidation";
-import { extractFactsWithContext } from "./facts";
+import {
+  runConsolidationPass,
+  runTierPromotion,
+  getConsolidationStats,
+} from "./consolidation";
+import { extractFactsWithContext, checkFactSupersession } from "./facts";
 
 // ============================================================================
 // Configuration
@@ -488,8 +492,21 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
 
       const facts = extractFactsWithContext(content, classification.sector);
       for (const fact of facts) {
+        const relatedFacts = db.findRelatedFacts(fact.content, fact.sector, 10);
+        const supersession = checkFactSupersession(fact, relatedFacts);
+
+        const newFactId = crypto.randomUUID();
+
+        if (supersession.supersedes && supersession.oldFactId) {
+          db.supersedeFact(
+            supersession.oldFactId,
+            newFactId,
+            supersession.reason || "New fact supersedes old",
+          );
+        }
+
         db.insertFact({
-          id: crypto.randomUUID(),
+          id: newFactId,
           memory_id: memoryId,
           session_id: sessionId,
           content: fact.content,
@@ -1596,6 +1613,146 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
           );
         },
       }),
+
+      chat_log_consolidate: tool({
+        description:
+          "Manually trigger memory consolidation and tier promotion. Merges similar memories and promotes frequently-accessed memories to higher tiers.",
+        args: {
+          max_merges: tool.schema
+            .number()
+            .optional()
+            .describe("Maximum memory pairs to merge (default: 20)"),
+          max_promotions: tool.schema
+            .number()
+            .optional()
+            .describe("Maximum memories to promote (default: 20)"),
+          dry_run: tool.schema
+            .boolean()
+            .optional()
+            .describe(
+              "Preview what would happen without making changes (default: false)",
+            ),
+        },
+        async execute(args) {
+          const maxMerges = args.max_merges || 20;
+          const maxPromotions = args.max_promotions || 20;
+          const dryRun = args.dry_run || false;
+
+          const stats = getConsolidationStats(db);
+
+          let output = `## Memory Consolidation${dryRun ? " (DRY RUN)" : ""}\n\n`;
+          output += `### Current State\n`;
+          output += `- Unconsolidated memories: ${stats.unconsolidated}\n`;
+          output += `- Potential merge pairs: ${stats.potentialMerges}\n`;
+          output += `- Previous consolidations: ${stats.consolidated}\n\n`;
+
+          const sessionCandidates = db.getPromotionCandidates(
+            "session",
+            3,
+            0.4,
+            50,
+          );
+          const projectCandidates = db.getPromotionCandidates(
+            "project",
+            5,
+            0.6,
+            50,
+          );
+
+          output += `### Promotion Candidates\n`;
+          output += `- Session → Project: ${sessionCandidates.length} candidates\n`;
+          output += `- Project → Personal: ${projectCandidates.length} candidates\n\n`;
+
+          if (dryRun) {
+            output += `### Preview (no changes made)\n`;
+            output += `Would merge up to ${Math.min(maxMerges, stats.potentialMerges)} similar memory pairs.\n`;
+            output += `Would promote up to ${Math.min(maxPromotions, sessionCandidates.length + projectCandidates.length)} memories.\n\n`;
+
+            if (sessionCandidates.length > 0) {
+              output += `#### Top Session → Project Candidates:\n`;
+              for (const m of sessionCandidates.slice(0, 5)) {
+                output += `- [${m.sector}] access=${m.access_count}, salience=${m.salience.toFixed(2)}\n`;
+                output += `  > ${m.content.substring(0, 100)}...\n`;
+              }
+            }
+          } else {
+            const mergeResult = runConsolidationPass(db, maxMerges);
+            const promotionResult = runTierPromotion(db, maxPromotions);
+
+            output += `### Results\n`;
+            output += `- **Memories merged**: ${mergeResult.merged}\n`;
+            output += `- **Session → Project promotions**: ${promotionResult.sessionToProject}\n`;
+            output += `- **Project → Personal promotions**: ${promotionResult.projectToPersonal}\n`;
+          }
+
+          return output;
+        },
+      }),
+
+      chat_log_memories_by_tier: tool({
+        description:
+          "List memories grouped by tier (session, project, personal). Useful for understanding memory distribution.",
+        args: {
+          tier: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Filter by tier: session, project, personal (default: all)",
+            ),
+          limit: tool.schema
+            .number()
+            .optional()
+            .describe("Maximum memories per tier (default: 20)"),
+        },
+        async execute(args) {
+          const limit = args.limit || 20;
+
+          if (args.tier) {
+            const memories = db.getMemoriesByTier(
+              args.tier as "session" | "project" | "personal",
+              limit,
+            );
+            let output = `## ${args.tier.charAt(0).toUpperCase() + args.tier.slice(1)} Tier Memories (${memories.length})\n\n`;
+
+            for (const m of memories) {
+              output += `### [${m.sector}] salience=${m.salience.toFixed(2)}, access=${m.access_count}\n`;
+              output += `> ${m.content.substring(0, 300)}${m.content.length > 300 ? "..." : ""}\n\n`;
+            }
+
+            return output;
+          }
+
+          const sessionMemories = db.getMemoriesByTier("session", limit);
+          const projectMemories = db.getMemoriesByTier("project", limit);
+          const personalMemories = db.getMemoriesByTier("personal", limit);
+
+          let output = `## Memories by Tier\n\n`;
+          output += `### Summary\n`;
+          output += `- Session: ${sessionMemories.length}${sessionMemories.length >= limit ? "+" : ""}\n`;
+          output += `- Project: ${projectMemories.length}${projectMemories.length >= limit ? "+" : ""}\n`;
+          output += `- Personal: ${personalMemories.length}${personalMemories.length >= limit ? "+" : ""}\n\n`;
+
+          if (personalMemories.length > 0) {
+            output += `### Personal Tier (highest priority)\n`;
+            for (const m of personalMemories.slice(0, 5)) {
+              output += `- [${m.sector}] ${m.content.substring(0, 150)}...\n`;
+            }
+            output += `\n`;
+          }
+
+          if (projectMemories.length > 0) {
+            output += `### Project Tier\n`;
+            for (const m of projectMemories.slice(0, 5)) {
+              output += `- [${m.sector}] ${m.content.substring(0, 150)}...\n`;
+            }
+            output += `\n`;
+          }
+
+          output += `_Use tier="session|project|personal" to see full list for a specific tier._`;
+
+          return output;
+        },
+      }),
     },
 
     config: async (cfg) => {
@@ -1840,6 +1997,7 @@ Use \`chat_log_list directory="${input.directory}"\` to see all sessions for thi
         );
 
         runConsolidationPass(db, 5);
+        runTierPromotion(db, 10);
       } catch {}
     },
   };

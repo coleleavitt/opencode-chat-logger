@@ -176,3 +176,85 @@ export function getConsolidationStats(db: ChatLoggerDb): {
 
   return { unconsolidated, consolidated, potentialMerges };
 }
+
+export interface TierPromotionResult {
+  sessionToProject: number;
+  projectToPersonal: number;
+}
+
+const TIER_PROMOTION_THRESHOLDS = {
+  sessionToProject: {
+    minAccessCount: 3,
+    minSalience: 0.4,
+    minCrossSessionCount: 2,
+  },
+  projectToPersonal: {
+    minAccessCount: 5,
+    minSalience: 0.6,
+    minCrossSessionCount: 3,
+  },
+};
+
+export function runTierPromotion(
+  db: ChatLoggerDb,
+  maxPromotions: number = 20,
+): TierPromotionResult {
+  const result: TierPromotionResult = {
+    sessionToProject: 0,
+    projectToPersonal: 0,
+  };
+
+  const sessionCandidates = db.getPromotionCandidates(
+    "session",
+    TIER_PROMOTION_THRESHOLDS.sessionToProject.minAccessCount,
+    TIER_PROMOTION_THRESHOLDS.sessionToProject.minSalience,
+    maxPromotions,
+  );
+
+  for (const memory of sessionCandidates) {
+    if (result.sessionToProject >= maxPromotions / 2) break;
+
+    const crossSessionCount = db.getCrossSessionMemoryCount(memory.content);
+    if (
+      crossSessionCount >=
+      TIER_PROMOTION_THRESHOLDS.sessionToProject.minCrossSessionCount
+    ) {
+      db.promoteMemoryTier(memory.id, "project");
+      db.logConsolidation({
+        action: "update",
+        source_ids: [memory.id],
+        result_id: memory.id,
+        reason: `Promoted session→project (access=${memory.access_count}, salience=${memory.salience.toFixed(2)}, cross-session=${crossSessionCount})`,
+      });
+      result.sessionToProject++;
+    }
+  }
+
+  const projectCandidates = db.getPromotionCandidates(
+    "project",
+    TIER_PROMOTION_THRESHOLDS.projectToPersonal.minAccessCount,
+    TIER_PROMOTION_THRESHOLDS.projectToPersonal.minSalience,
+    maxPromotions,
+  );
+
+  for (const memory of projectCandidates) {
+    if (result.projectToPersonal >= maxPromotions / 2) break;
+
+    const crossSessionCount = db.getCrossSessionMemoryCount(memory.content);
+    if (
+      crossSessionCount >=
+      TIER_PROMOTION_THRESHOLDS.projectToPersonal.minCrossSessionCount
+    ) {
+      db.promoteMemoryTier(memory.id, "personal");
+      db.logConsolidation({
+        action: "update",
+        source_ids: [memory.id],
+        result_id: memory.id,
+        reason: `Promoted project→personal (access=${memory.access_count}, salience=${memory.salience.toFixed(2)}, cross-session=${crossSessionCount})`,
+      });
+      result.projectToPersonal++;
+    }
+  }
+
+  return result;
+}
