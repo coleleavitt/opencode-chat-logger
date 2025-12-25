@@ -381,7 +381,7 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
       toolCount?: number;
     },
   ): Promise<string | null> => {
-    if (content.length < 50) return null;
+    if (content.trim().length < 3) return null;
 
     const classification = classifySector(content);
     const salience = estimateInitialSalience(
@@ -1431,7 +1431,7 @@ Use \`chat_log_list directory="${input.directory}"\` to see all sessions for thi
       });
       db.incrementMessageCount(sessionID);
 
-      if (message.role === "user" && contentStr.length > 100) {
+      if (message.role === "user" && contentStr.trim().length >= 3) {
         const toolCount = parts.filter((p) => p.type === "tool").length;
         createMemoryFromContent(sessionID, contentStr, {
           isUserMessage: true,
