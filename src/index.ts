@@ -401,6 +401,42 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
     return embedder;
   };
 
+  const SKIP_PATTERNS = [
+    /^\[BACKGROUND TASK/i,
+    /^\[search-mode\]/i,
+    /^\[analyze-mode\]/i,
+    /^┌──\[/,
+    /^└─[❯>]/,
+    /^Thinking:/i,
+    /^→\s*(Read|Edit|Write|Glob|Grep)/i,
+  ];
+
+  const NOISE_PATTERNS = [
+    /\[BACKGROUND TASK COMPLETED\][^\n]*/g,
+    /^Thinking:.*$/gm,
+    /^→\s*(Read|Edit|Write|Glob|Grep)[^\n]*/gm,
+    /┌──\[[^\]]+\]─[^\n]*/g,
+    /└─[❯>][^\n]*/g,
+    /```[\s\S]*?```/g,
+    /\[search-mode\][\s\S]*?\[\/search-mode\]/gi,
+    /\[analyze-mode\][\s\S]*?\[\/analyze-mode\]/gi,
+  ];
+
+  const shouldSkipContent = (text: string): boolean => {
+    const trimmed = text.trim();
+    if (trimmed.length < 20) return true;
+    if (/^(continue|yes|no|ok|done|thanks|y|n)$/i.test(trimmed)) return true;
+    return SKIP_PATTERNS.some((p) => p.test(trimmed));
+  };
+
+  const preprocessContent = (text: string): string => {
+    let cleaned = text;
+    for (const pattern of NOISE_PATTERNS) {
+      cleaned = cleaned.replace(pattern, " ");
+    }
+    return cleaned.replace(/\s+/g, " ").trim();
+  };
+
   const createMemoryFromContent = async (
     sessionId: string,
     content: string,
@@ -410,9 +446,12 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
       toolCount?: number;
     },
   ): Promise<string | null> => {
-    if (content.trim().length < 3) return null;
+    if (shouldSkipContent(content)) return null;
 
-    const classification = classifySector(content);
+    const cleanedContent = preprocessContent(content);
+    if (cleanedContent.length < 20) return null;
+
+    const classification = classifySector(cleanedContent);
     const salience = estimateInitialSalience(
       content,
       classification.sector,
@@ -425,7 +464,7 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
     db.insertMemory({
       id: memoryId,
       session_id: sessionId,
-      content: content.substring(0, 2000),
+      content: cleanedContent.substring(0, 2000),
       sector: classification.sector,
       tier: "session",
       salience,
@@ -441,7 +480,7 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
 
     try {
       const emb = await getEmbedder();
-      const vector = await emb.embed(content.substring(0, 1000));
+      const vector = await emb.embed(cleanedContent.substring(0, 1000));
       db.insertMemoryVector(memoryId, classification.sector, vector);
 
       await createWaypointsForMemory(db, memoryId);

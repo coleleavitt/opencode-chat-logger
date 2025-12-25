@@ -291,6 +291,14 @@ export async function createEmbeddingProvider(
 ): Promise<EmbeddingProvider> {
   const { toast, ollamaConfig, workerPath } = options;
 
+  // Priority 1: Ollama (768d nomic-embed-text, GPU-accelerated)
+  try {
+    const ollama = new OllamaEmbedding(ollamaConfig);
+    await ollama.embed("test");
+    return ollama;
+  } catch {}
+
+  // Priority 2: Subprocess transformers.js (384d bge-small-en-v1.5)
   if (workerPath) {
     try {
       const subprocess = new SubprocessEmbedding(workerPath);
@@ -299,14 +307,9 @@ export async function createEmbeddingProvider(
     } catch {}
   }
 
-  try {
-    const ollama = new OllamaEmbedding(ollamaConfig);
-    await ollama.embed("test");
-    return ollama;
-  } catch {}
-
+  // Priority 3: Synthetic fallback
   if (toast) {
-    toast("Using synthetic embeddings (local ML and Ollama unavailable)");
+    toast("Using synthetic embeddings (Ollama and local ML unavailable)");
   }
   return new SyntheticEmbedding();
 }
