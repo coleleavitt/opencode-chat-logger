@@ -1864,7 +1864,32 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
         limit: 10,
       });
 
-      if (projectSessions.length === 0) return;
+      const personalMemories = db.getPersonalMemories(5);
+      const projectMemories = db.getProjectMemories(input.directory, 5);
+      const currentFacts = db.getCurrentFacts(undefined, 10);
+
+      let memoryContext = "\n[Recalled Memory Context]\n";
+
+      if (personalMemories.length > 0) {
+        memoryContext += "\n## User Preferences & Cross-Project Knowledge\n";
+        for (const m of personalMemories) {
+          memoryContext += `- ${m.content.substring(0, 200)}${m.content.length > 200 ? "..." : ""}\n`;
+        }
+      }
+
+      if (projectMemories.length > 0) {
+        memoryContext += "\n## This Project's Context\n";
+        for (const m of projectMemories) {
+          memoryContext += `- [${m.sector}] ${m.content.substring(0, 200)}${m.content.length > 200 ? "..." : ""}\n`;
+        }
+      }
+
+      if (currentFacts.length > 0) {
+        memoryContext += "\n## Known Facts\n";
+        for (const f of currentFacts) {
+          memoryContext += `- ${f.content.substring(0, 150)}\n`;
+        }
+      }
 
       const totalMessages = projectSessions.reduce(
         (sum, s) => sum + s.message_count,
@@ -1875,13 +1900,24 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
         ? new Date(lastSession.updated_at).toLocaleDateString()
         : "unknown";
 
-      const memoryHint = `
-[Project Memory]
-You have ${projectSessions.length} past session(s) in this project directory (${totalMessages} total messages).
-Most recent: "${lastSession?.title || "untitled"}" on ${lastDate}.
-Use \`chat_log_search\` to recall previous work, decisions, or code patterns discussed.
-Use \`chat_log_list directory="${input.directory}"\` to see all sessions for this project.
-`;
+      if (projectSessions.length > 0) {
+        memoryContext += `\n## Session History\n`;
+        memoryContext += `${projectSessions.length} past session(s) in this project (${totalMessages} messages).\n`;
+        memoryContext += `Most recent: "${lastSession?.title || "untitled"}" on ${lastDate}.\n`;
+      }
+
+      memoryContext += `\n## Memory Tools Available\n`;
+      memoryContext += `- \`chat_log_semantic_search query="..."\` - Find relevant memories by meaning\n`;
+      memoryContext += `- \`chat_log_related_entities entity_name="..."\` - Discover entity relationships\n`;
+      memoryContext += `- \`chat_log_context topic="..."\` - Get context from past sessions\n`;
+
+      const hasContent =
+        personalMemories.length > 0 ||
+        projectMemories.length > 0 ||
+        currentFacts.length > 0 ||
+        projectSessions.length > 0;
+
+      if (!hasContent) return;
 
       type AgentConfig = { prompt?: string };
       const agents = cfg.agent as Record<string, AgentConfig> | undefined;
@@ -1890,7 +1926,7 @@ Use \`chat_log_list directory="${input.directory}"\` to see all sessions for thi
         for (const agentName of Object.keys(agents)) {
           const agent = agents[agentName];
           if (agent && typeof agent.prompt === "string") {
-            agent.prompt = agent.prompt + memoryHint;
+            agent.prompt = agent.prompt + memoryContext;
           }
         }
       }
