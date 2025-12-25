@@ -1187,83 +1187,83 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
         },
       }),
 
-      chat_log_memory_prune: tool({
-        description:
-          "Prune decayed memories below a salience threshold. Memories naturally decay based on their sector (architecture decays slowest, debugging fastest).",
-        args: {
-          threshold: tool.schema
-            .number()
-            .optional()
-            .describe(
-              "Salience threshold below which to prune (default: 0.01)",
-            ),
-          dry_run: tool.schema
-            .boolean()
-            .optional()
-            .describe(
-              "Preview what would be pruned without actually deleting (default: true)",
-            ),
-        },
-        async execute(args) {
-          const threshold = args.threshold || 0.01;
-          const dryRun = args.dry_run !== false;
-
-          try {
-            const allMemories = db.getAllMemoriesWithVectors();
-            const toPrune: Array<{
-              id: string;
-              sector: Sector;
-              salience: number;
-              content: string;
-            }> = [];
-
-            for (const memory of allMemories) {
-              const effectiveSalience = db.getDecayedSalience(memory);
-              if (effectiveSalience < threshold) {
-                toPrune.push({
-                  id: memory.id,
-                  sector: memory.sector,
-                  salience: effectiveSalience,
-                  content: memory.content.substring(0, 100),
-                });
-              }
-            }
-
-            if (toPrune.length === 0) {
-              return `No memories below threshold ${threshold}. All ${allMemories.length} memories are above the salience threshold.`;
-            }
-
-            let output = `## Memory Pruning ${dryRun ? "(DRY RUN)" : ""}\n\n`;
-            output += `Found ${toPrune.length} memories below salience threshold ${threshold}:\n\n`;
-
-            const bySector = new Map<Sector, number>();
-            for (const m of toPrune) {
-              bySector.set(m.sector, (bySector.get(m.sector) || 0) + 1);
-            }
-
-            output += `### By Sector:\n`;
-            for (const [sector, count] of bySector) {
-              output += `- ${sector}: ${count}\n`;
-            }
-            output += `\n`;
-
-            if (!dryRun) {
-              const pruned = db.pruneDecayedMemories(threshold);
-              output += `**Pruned ${pruned} memories.**\n`;
-            } else {
-              output += `_Run with dry_run=false to actually prune these memories._\n\n`;
-              output += `### Preview (first 10):\n`;
-              for (const m of toPrune.slice(0, 10)) {
-                output += `- [${m.sector}] salience=${m.salience.toFixed(4)}: ${m.content}...\n`;
-              }
-            }
-
-            return output;
-          } catch (e) {
-            return `Error pruning memories: ${e}`;
-          }
-        },
-      }),
+      // chat_log_memory_prune: tool({
+      //   description:
+      //     "Prune decayed memories below a salience threshold. Memories naturally decay based on their sector (architecture decays slowest, debugging fastest).",
+      //   args: {
+      //     threshold: tool.schema
+      //       .number()
+      //       .optional()
+      //       .describe(
+      //         "Salience threshold below which to prune (default: 0.01)",
+      //       ),
+      //     dry_run: tool.schema
+      //       .boolean()
+      //       .optional()
+      //       .describe(
+      //         "Preview what would be pruned without actually deleting (default: true)",
+      //       ),
+      //   },
+      //   async execute(args) {
+      //     const threshold = args.threshold || 0.01;
+      //     const dryRun = args.dry_run !== false;
+      //
+      //     try {
+      //       const allMemories = db.getAllMemoriesWithVectors();
+      //       const toPrune: Array<{
+      //         id: string;
+      //         sector: Sector;
+      //         salience: number;
+      //         content: string;
+      //       }> = [];
+      //
+      //       for (const memory of allMemories) {
+      //         const effectiveSalience = db.getDecayedSalience(memory);
+      //         if (effectiveSalience < threshold) {
+      //           toPrune.push({
+      //             id: memory.id,
+      //             sector: memory.sector,
+      //             salience: effectiveSalience,
+      //             content: memory.content.substring(0, 100),
+      //           });
+      //         }
+      //       }
+      //
+      //       if (toPrune.length === 0) {
+      //         return `No memories below threshold ${threshold}. All ${allMemories.length} memories are above the salience threshold.`;
+      //       }
+      //
+      //       let output = `## Memory Pruning ${dryRun ? "(DRY RUN)" : ""}\n\n`;
+      //       output += `Found ${toPrune.length} memories below salience threshold ${threshold}:\n\n`;
+      //
+      //       const bySector = new Map<Sector, number>();
+      //       for (const m of toPrune) {
+      //         bySector.set(m.sector, (bySector.get(m.sector) || 0) + 1);
+      //       }
+      //
+      //       output += `### By Sector:\n`;
+      //       for (const [sector, count] of bySector) {
+      //         output += `- ${sector}: ${count}\n`;
+      //       }
+      //       output += `\n`;
+      //
+      //       if (!dryRun) {
+      //         const pruned = db.pruneDecayedMemories(threshold);
+      //         output += `**Pruned ${pruned} memories.**\n`;
+      //       } else {
+      //         output += `_Run with dry_run=false to actually prune these memories._\n\n`;
+      //         output += `### Preview (first 10):\n`;
+      //         for (const m of toPrune.slice(0, 10)) {
+      //           output += `- [${m.sector}] salience=${m.salience.toFixed(4)}: ${m.content}...\n`;
+      //         }
+      //       }
+      //
+      //       return output;
+      //     } catch (e) {
+      //       return `Error pruning memories: ${e}`;
+      //     }
+      //   },
+      // }),
 
       chat_log_related_memories: tool({
         description:
