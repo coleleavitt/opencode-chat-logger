@@ -256,6 +256,7 @@ export async function embedWithSectorContext(
     architecture: "Architecture decision: ",
     discussion: "Discussion: ",
     procedural: "Process or procedure: ",
+    emotional: "Emotional context: ",
   };
 
   const prefixedContent = sectorPrefixes[sector] + content;

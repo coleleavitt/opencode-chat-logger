@@ -170,6 +170,39 @@ const SECTOR_PATTERNS: SectorPattern[] = [
       "guide",
     ],
   },
+  {
+    sector: "emotional",
+    patterns: [
+      /\b(frustrat|annoy|angry|upset|confus|stuck|lost|overwhelm)\w*/i,
+      /\b(excit|happy|great|awesome|love|enjoy|satisf|proud)\w*/i,
+      /\b(worried|concern|anxious|nervous|uncertain|doubt)\w*/i,
+      /\b(bored|tired|exhaust|burnt?\s*out)\w*/i,
+      /\b(thank|grateful|appreciate)\w*/i,
+      /[!]{2,}|\?{2,}/,
+      /\b(ugh|argh|yay|wow|omg|wtf)\b/i,
+    ],
+    keywords: [
+      "frustrated",
+      "annoyed",
+      "confused",
+      "stuck",
+      "lost",
+      "overwhelmed",
+      "excited",
+      "happy",
+      "great",
+      "awesome",
+      "love",
+      "worried",
+      "concerned",
+      "anxious",
+      "tired",
+      "exhausted",
+      "grateful",
+      "thanks",
+      "appreciate",
+    ],
+  },
 ];
 
 function countPatternMatches(content: string, patterns: RegExp[]): number {
@@ -328,5 +361,6 @@ export function getAllSectors(): Sector[] {
     "architecture",
     "discussion",
     "procedural",
+    "emotional",
   ];
 }

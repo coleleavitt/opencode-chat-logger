@@ -21,6 +21,9 @@ import {
   formatMemoriesForContext,
 } from "./scoring";
 import { createWaypointsForMemory, traverseFromMemory } from "./graph";
+import { extractEntitiesAndRelations } from "./entities";
+import { runConsolidationPass } from "./consolidation";
+import { extractFactsWithContext } from "./facts";
 
 // ============================================================================
 // Configuration
@@ -420,8 +423,12 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
       session_id: sessionId,
       content: content.substring(0, 2000),
       sector: classification.sector,
+      tier: "session",
       salience,
       decay_lambda: decayRate,
+      valid_from: null,
+      valid_to: null,
+      is_consolidated: false,
       metadata_json: JSON.stringify({
         confidence: classification.confidence,
         secondarySectors: classification.secondarySectors,
@@ -434,6 +441,64 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
       db.insertMemoryVector(memoryId, classification.sector, vector);
 
       await createWaypointsForMemory(db, memoryId);
+    } catch {}
+
+    try {
+      const { entities, relations } = extractEntitiesAndRelations(content);
+
+      for (const entity of entities) {
+        const entityId = crypto.randomUUID();
+        db.upsertEntity({
+          id: entityId,
+          name: entity.name,
+          type: entity.type,
+          metadata_json: JSON.stringify({ confidence: entity.confidence }),
+        });
+
+        const existing = db.getEntityByName(entity.name, entity.type);
+        if (existing) {
+          db.insertEntityMention({
+            entity_id: existing.id,
+            memory_id: memoryId,
+            session_id: sessionId,
+            context: entity.context.substring(0, 500),
+          });
+        }
+      }
+
+      for (const relation of relations) {
+        const sourceEntity = db.getEntityByName(
+          relation.sourceEntity.name,
+          relation.sourceEntity.type,
+        );
+        const targetEntity = db.getEntityByName(
+          relation.targetEntity.name,
+          relation.targetEntity.type,
+        );
+
+        if (sourceEntity && targetEntity) {
+          db.upsertEntityRelation({
+            source_entity_id: sourceEntity.id,
+            target_entity_id: targetEntity.id,
+            relation_type: relation.relationType,
+            weight: relation.confidence,
+          });
+        }
+      }
+
+      const facts = extractFactsWithContext(content, classification.sector);
+      for (const fact of facts) {
+        db.insertFact({
+          id: crypto.randomUUID(),
+          memory_id: memoryId,
+          session_id: sessionId,
+          content: fact.content,
+          sector: fact.sector,
+          confidence: fact.confidence,
+          valid_from: fact.validFrom,
+          valid_to: fact.validTo,
+        });
+      }
     } catch {}
 
     return memoryId;
@@ -1324,6 +1389,213 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
           }
         },
       }),
+
+      chat_log_entities: tool({
+        description:
+          "Search and list extracted entities (files, classes, functions, concepts) from past sessions.",
+        args: {
+          query: tool.schema
+            .string()
+            .optional()
+            .describe("Search query for entity names"),
+          type: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Filter by entity type: file, class, function, variable, project, person, concept, tool, error",
+            ),
+          limit: tool.schema
+            .number()
+            .optional()
+            .describe("Maximum results (default: 50)"),
+        },
+        async execute(args) {
+          const limit = args.limit || 50;
+
+          if (args.query) {
+            const results = db.searchEntities(args.query, limit);
+            if (results.length === 0) {
+              return `No entities found matching "${args.query}"`;
+            }
+
+            let output = `## Entities matching "${args.query}"\n\n`;
+            for (const entity of results) {
+              output += `- **${entity.name}** [${entity.type}]\n`;
+              output += `  - Mentions: ${entity.mention_count}\n`;
+              output += `  - First seen: ${entity.first_seen}\n`;
+              output += `  - Last seen: ${entity.last_seen}\n\n`;
+            }
+            return output;
+          }
+
+          const entities = db.getTopEntities(
+            limit,
+            args.type as import("./db").EntityType | undefined,
+          );
+          if (entities.length === 0) {
+            return "No entities found in the database.";
+          }
+
+          let output = `## Top ${entities.length} Entities${args.type ? ` (type: ${args.type})` : ""}\n\n`;
+          for (const entity of entities) {
+            output += `- **${entity.name}** [${entity.type}] - ${entity.mention_count} mentions\n`;
+          }
+          return output;
+        },
+      }),
+
+      chat_log_timeline: tool({
+        description:
+          "Query memories by time range. Useful for 'what happened last week' queries.",
+        args: {
+          start_date: tool.schema
+            .string()
+            .describe("Start date (ISO format, e.g., 2024-01-01)"),
+          end_date: tool.schema
+            .string()
+            .optional()
+            .describe("End date (ISO format, defaults to now)"),
+          sector: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Filter by sector: code_change, debugging, architecture, discussion, procedural, emotional",
+            ),
+          directory: tool.schema
+            .string()
+            .optional()
+            .describe("Filter by project directory"),
+          limit: tool.schema
+            .number()
+            .optional()
+            .describe("Maximum results (default: 50)"),
+        },
+        async execute(args) {
+          const endDate = args.end_date || new Date().toISOString();
+          const memories = db.getMemoriesByTimeRange(args.start_date, endDate, {
+            sector: args.sector as import("./db").Sector | undefined,
+            directory: args.directory,
+            limit: args.limit || 50,
+          });
+
+          if (memories.length === 0) {
+            return `No memories found between ${args.start_date} and ${endDate}`;
+          }
+
+          let output = `## Timeline: ${args.start_date} to ${endDate.substring(0, 10)}\n\n`;
+          output += `Found ${memories.length} memories:\n\n`;
+
+          const bySector = new Map<string, number>();
+          for (const m of memories) {
+            bySector.set(m.sector, (bySector.get(m.sector) || 0) + 1);
+          }
+
+          output += `### By Sector\n`;
+          for (const [sector, count] of bySector) {
+            output += `- ${sector}: ${count}\n`;
+          }
+          output += `\n### Memories\n\n`;
+
+          for (const m of memories.slice(0, 20)) {
+            output += `#### [${m.sector}] ${m.created_at}\n`;
+            output += `> ${m.content.substring(0, 300)}${m.content.length > 300 ? "..." : ""}\n\n`;
+          }
+
+          if (memories.length > 20) {
+            output += `\n_...and ${memories.length - 20} more memories_`;
+          }
+
+          return output;
+        },
+      }),
+
+      chat_log_facts: tool({
+        description:
+          "Search extracted facts from conversations. Facts are discrete pieces of knowledge.",
+        args: {
+          query: tool.schema
+            .string()
+            .optional()
+            .describe("Search query for facts"),
+          current_only: tool.schema
+            .boolean()
+            .optional()
+            .describe(
+              "Only show current (not superseded) facts (default: true)",
+            ),
+          limit: tool.schema
+            .number()
+            .optional()
+            .describe("Maximum results (default: 50)"),
+        },
+        async execute(args) {
+          const limit = args.limit || 50;
+
+          if (args.query) {
+            const results = db.searchFacts(args.query, limit);
+            if (results.length === 0) {
+              return `No facts found matching "${args.query}"`;
+            }
+
+            let output = `## Facts matching "${args.query}"\n\n`;
+            for (const fact of results) {
+              const status = fact.is_current ? "current" : "superseded";
+              output += `### [${fact.sector}] (${status})\n`;
+              output += `${fact.content}\n`;
+              output += `- Confidence: ${(fact.confidence * 100).toFixed(0)}%\n`;
+              output += `- Created: ${fact.created_at}\n`;
+              if (fact.valid_from || fact.valid_to) {
+                output += `- Valid: ${fact.valid_from || "?"} to ${fact.valid_to || "present"}\n`;
+              }
+              output += `\n`;
+            }
+            return output;
+          }
+
+          const facts = db.getCurrentFacts(undefined, limit);
+          if (facts.length === 0) {
+            return "No facts stored yet.";
+          }
+
+          let output = `## Current Facts (${facts.length})\n\n`;
+          for (const fact of facts) {
+            output += `- **[${fact.sector}]** ${fact.content.substring(0, 200)}${fact.content.length > 200 ? "..." : ""}\n`;
+          }
+          return output;
+        },
+      }),
+
+      chat_log_extended_stats: tool({
+        description:
+          "Get extended statistics including entities, facts, and consolidation info.",
+        args: {},
+        async execute() {
+          const stats = db.getExtendedStats();
+          const dbPath = path.join(logDir, "chat-logs.db");
+          const dbSize = fs.existsSync(dbPath)
+            ? (fs.statSync(dbPath).size / 1024 / 1024).toFixed(2) + " MB"
+            : "unknown";
+
+          return (
+            `## Extended Chat Log Statistics\n\n` +
+            `### Core\n` +
+            `- **Sessions**: ${stats.sessions}\n` +
+            `- **Messages**: ${stats.messages}\n` +
+            `- **Tool Calls**: ${stats.toolCalls}\n\n` +
+            `### Memory System\n` +
+            `- **Memories**: ${stats.memories}\n` +
+            `- **Waypoints**: ${stats.waypoints}\n\n` +
+            `### Advanced Features\n` +
+            `- **Entities**: ${stats.entities}\n` +
+            `- **Entity Relations**: ${stats.entityRelations}\n` +
+            `- **Facts**: ${stats.facts}\n` +
+            `- **Consolidations**: ${stats.consolidations}\n\n` +
+            `### Storage\n` +
+            `- **Database Size**: ${dbSize}\n` +
+            `- **Log Directory**: ${logDir}\n`
+          );
+        },
+      }),
     },
 
     config: async (cfg) => {
@@ -1566,6 +1838,8 @@ Use \`chat_log_list directory="${input.directory}"\` to see all sessions for thi
           sessionID,
           `Session with ${messages.length} messages. Topics: ${relevantMemories.map((m) => m.memory.sector).join(", ")}`,
         );
+
+        runConsolidationPass(db, 5);
       } catch {}
     },
   };

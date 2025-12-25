@@ -7,7 +7,22 @@ export type Sector =
   | "debugging"
   | "architecture"
   | "discussion"
-  | "procedural";
+  | "procedural"
+  | "emotional";
+
+export type EntityType =
+  | "file"
+  | "class"
+  | "function"
+  | "variable"
+  | "project"
+  | "person"
+  | "concept"
+  | "tool"
+  | "error"
+  | "other";
+
+export type MemoryTier = "session" | "project" | "personal";
 
 export const SECTOR_DECAY_RATES: Record<Sector, number> = {
   code_change: 0.01,
@@ -15,6 +30,7 @@ export const SECTOR_DECAY_RATES: Record<Sector, number> = {
   architecture: 0.003,
   discussion: 0.02,
   procedural: 0.005,
+  emotional: 0.03,
 };
 
 export interface DbSession {
@@ -61,11 +77,15 @@ export interface DbMemory {
   session_id: string;
   content: string;
   sector: Sector;
+  tier: MemoryTier;
   salience: number;
   decay_lambda: number;
   access_count: number;
   last_accessed: string;
   created_at: string;
+  valid_from: string | null;
+  valid_to: string | null;
+  is_consolidated: boolean;
   metadata_json: string | null;
 }
 
@@ -82,6 +102,59 @@ export interface DbWaypoint {
   src_memory_id: string;
   dst_memory_id: string;
   weight: number;
+  created_at: string;
+}
+
+export interface DbEntity {
+  id: string;
+  name: string;
+  type: EntityType;
+  first_seen: string;
+  last_seen: string;
+  mention_count: number;
+  metadata_json: string | null;
+}
+
+export interface DbEntityMention {
+  id: number;
+  entity_id: string;
+  memory_id: string | null;
+  session_id: string;
+  context: string;
+  created_at: string;
+}
+
+export interface DbEntityRelation {
+  id: number;
+  source_entity_id: string;
+  target_entity_id: string;
+  relation_type: string;
+  weight: number;
+  first_seen: string;
+  last_seen: string;
+  mention_count: number;
+}
+
+export interface DbFact {
+  id: string;
+  memory_id: string | null;
+  session_id: string;
+  content: string;
+  sector: Sector;
+  confidence: number;
+  valid_from: string | null;
+  valid_to: string | null;
+  is_current: boolean;
+  created_at: string;
+  metadata_json: string | null;
+}
+
+export interface DbConsolidationLog {
+  id: number;
+  action: "merge" | "update" | "delete" | "create";
+  source_ids: string;
+  result_id: string | null;
+  reason: string;
   created_at: string;
 }
 
@@ -122,13 +195,37 @@ export class ChatLoggerDb {
   }
 
   private runMigrations(): void {
-    const columns = this.db
+    const sessionCols = this.db
       .prepare("PRAGMA table_info(sessions)")
       .all() as Array<{ name: string }>;
-    const hasColumn = (name: string) => columns.some((c) => c.name === name);
+    const hasSessionCol = (name: string) =>
+      sessionCols.some((c) => c.name === name);
 
-    if (!hasColumn("summary")) {
+    if (!hasSessionCol("summary")) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN summary TEXT");
+    }
+
+    const memoryCols = this.db
+      .prepare("PRAGMA table_info(memories)")
+      .all() as Array<{ name: string }>;
+    const hasMemoryCol = (name: string) =>
+      memoryCols.some((c) => c.name === name);
+
+    if (!hasMemoryCol("tier")) {
+      this.db.exec(
+        "ALTER TABLE memories ADD COLUMN tier TEXT DEFAULT 'session'",
+      );
+    }
+    if (!hasMemoryCol("valid_from")) {
+      this.db.exec("ALTER TABLE memories ADD COLUMN valid_from TEXT");
+    }
+    if (!hasMemoryCol("valid_to")) {
+      this.db.exec("ALTER TABLE memories ADD COLUMN valid_to TEXT");
+    }
+    if (!hasMemoryCol("is_consolidated")) {
+      this.db.exec(
+        "ALTER TABLE memories ADD COLUMN is_consolidated INTEGER DEFAULT 0",
+      );
     }
   }
 
@@ -192,12 +289,16 @@ export class ChatLoggerDb {
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
         content TEXT NOT NULL,
-        sector TEXT NOT NULL CHECK (sector IN ('code_change', 'debugging', 'architecture', 'discussion', 'procedural')),
+        sector TEXT NOT NULL CHECK (sector IN ('code_change', 'debugging', 'architecture', 'discussion', 'procedural', 'emotional')),
+        tier TEXT NOT NULL DEFAULT 'session' CHECK (tier IN ('session', 'project', 'personal')),
         salience REAL NOT NULL DEFAULT 0.5,
         decay_lambda REAL NOT NULL DEFAULT 0.01,
         access_count INTEGER NOT NULL DEFAULT 0,
         last_accessed TEXT NOT NULL DEFAULT (datetime('now')),
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        valid_from TEXT,
+        valid_to TEXT,
+        is_consolidated INTEGER NOT NULL DEFAULT 0,
         metadata_json TEXT,
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
       );
@@ -272,6 +373,116 @@ export class ChatLoggerDb {
         INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', OLD.rowid, OLD.content);
         INSERT INTO memories_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
       END;
+
+      -- Entity system tables
+      CREATE TABLE IF NOT EXISTS entities (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        type TEXT NOT NULL CHECK (type IN ('file', 'class', 'function', 'variable', 'project', 'person', 'concept', 'tool', 'error', 'other')),
+        first_seen TEXT NOT NULL DEFAULT (datetime('now')),
+        last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+        mention_count INTEGER NOT NULL DEFAULT 1,
+        metadata_json TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
+      CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_name_type ON entities(name, type);
+
+      CREATE TABLE IF NOT EXISTS entity_mentions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_id TEXT NOT NULL,
+        memory_id TEXT,
+        session_id TEXT NOT NULL,
+        context TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE SET NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity_id);
+      CREATE INDEX IF NOT EXISTS idx_entity_mentions_session ON entity_mentions(session_id);
+
+      CREATE TABLE IF NOT EXISTS entity_relations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_entity_id TEXT NOT NULL,
+        target_entity_id TEXT NOT NULL,
+        relation_type TEXT NOT NULL,
+        weight REAL NOT NULL DEFAULT 1.0,
+        first_seen TEXT NOT NULL DEFAULT (datetime('now')),
+        last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+        mention_count INTEGER NOT NULL DEFAULT 1,
+        FOREIGN KEY (source_entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+        FOREIGN KEY (target_entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+        UNIQUE(source_entity_id, target_entity_id, relation_type)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_entity_relations_source ON entity_relations(source_entity_id);
+      CREATE INDEX IF NOT EXISTS idx_entity_relations_target ON entity_relations(target_entity_id);
+
+      -- Facts table for extracted knowledge
+      CREATE TABLE IF NOT EXISTS facts (
+        id TEXT PRIMARY KEY,
+        memory_id TEXT,
+        session_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        sector TEXT NOT NULL CHECK (sector IN ('code_change', 'debugging', 'architecture', 'discussion', 'procedural', 'emotional')),
+        confidence REAL NOT NULL DEFAULT 0.8,
+        valid_from TEXT,
+        valid_to TEXT,
+        is_current INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        metadata_json TEXT,
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE SET NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_facts_session ON facts(session_id);
+      CREATE INDEX IF NOT EXISTS idx_facts_is_current ON facts(is_current);
+      CREATE INDEX IF NOT EXISTS idx_facts_sector ON facts(sector);
+
+      -- FTS for facts
+      CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
+        content,
+        content_rowid='rowid',
+        tokenize='porter unicode61'
+      );
+
+      CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+        INSERT INTO facts_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
+        INSERT INTO facts_fts(facts_fts, rowid, content) VALUES ('delete', OLD.rowid, OLD.content);
+      END;
+
+      -- FTS for entities
+      CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
+        name,
+        content_rowid='rowid',
+        tokenize='porter unicode61'
+      );
+
+      CREATE TRIGGER IF NOT EXISTS entities_ai AFTER INSERT ON entities BEGIN
+        INSERT INTO entities_fts(rowid, name) VALUES (NEW.rowid, NEW.name);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS entities_ad AFTER DELETE ON entities BEGIN
+        INSERT INTO entities_fts(entities_fts, rowid, name) VALUES ('delete', OLD.rowid, OLD.name);
+      END;
+
+      -- Consolidation log
+      CREATE TABLE IF NOT EXISTS consolidation_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        action TEXT NOT NULL CHECK (action IN ('merge', 'update', 'delete', 'create')),
+        source_ids TEXT NOT NULL,
+        result_id TEXT,
+        reason TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_consolidation_created ON consolidation_log(created_at);
     `);
   }
 
@@ -351,8 +562,8 @@ export class ChatLoggerDb {
     memory: Omit<DbMemory, "access_count" | "last_accessed" | "created_at">,
   ): void {
     const stmt = this.db.prepare(`
-      INSERT INTO memories (id, session_id, content, sector, salience, decay_lambda, metadata_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO memories (id, session_id, content, sector, tier, salience, decay_lambda, valid_from, valid_to, is_consolidated, metadata_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
@@ -360,8 +571,12 @@ export class ChatLoggerDb {
       memory.session_id,
       memory.content,
       memory.sector,
+      memory.tier,
       memory.salience,
       memory.decay_lambda,
+      memory.valid_from,
+      memory.valid_to,
+      memory.is_consolidated ? 1 : 0,
       memory.metadata_json,
     );
   }
@@ -665,6 +880,338 @@ export class ChatLoggerDb {
       SELECT * FROM messages WHERE embedding IS NULL ORDER BY created_at DESC LIMIT ?
     `);
     return stmt.all(limit) as DbMessage[];
+  }
+
+  upsertEntity(entity: {
+    id: string;
+    name: string;
+    type: EntityType;
+    metadata_json?: string | null;
+  }): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO entities (id, name, type, metadata_json)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(name, type) DO UPDATE SET
+        last_seen = datetime('now'),
+        mention_count = mention_count + 1
+    `);
+    stmt.run(entity.id, entity.name, entity.type, entity.metadata_json ?? null);
+  }
+
+  getEntity(entityId: string): DbEntity | null {
+    const stmt = this.db.prepare(`SELECT * FROM entities WHERE id = ?`);
+    return stmt.get(entityId) as DbEntity | null;
+  }
+
+  getEntityByName(name: string, type?: EntityType): DbEntity | null {
+    if (type) {
+      const stmt = this.db.prepare(
+        `SELECT * FROM entities WHERE name = ? AND type = ?`,
+      );
+      return stmt.get(name, type) as DbEntity | null;
+    }
+    const stmt = this.db.prepare(
+      `SELECT * FROM entities WHERE name = ? ORDER BY mention_count DESC LIMIT 1`,
+    );
+    return stmt.get(name) as DbEntity | null;
+  }
+
+  searchEntities(query: string, limit: number = 20): DbEntity[] {
+    const stmt = this.db.prepare(`
+      SELECT e.* FROM entities_fts
+      JOIN entities e ON entities_fts.rowid = e.rowid
+      WHERE entities_fts MATCH ?
+      ORDER BY e.mention_count DESC
+      LIMIT ?
+    `);
+    return stmt.all(query, limit) as DbEntity[];
+  }
+
+  getTopEntities(limit: number = 50, type?: EntityType): DbEntity[] {
+    let sql = `SELECT * FROM entities`;
+    const params: (string | number)[] = [];
+
+    if (type) {
+      sql += ` WHERE type = ?`;
+      params.push(type);
+    }
+
+    sql += ` ORDER BY mention_count DESC LIMIT ?`;
+    params.push(limit);
+
+    const stmt = this.db.prepare(sql);
+    return stmt.all(...params) as DbEntity[];
+  }
+
+  insertEntityMention(mention: {
+    entity_id: string;
+    memory_id?: string | null;
+    session_id: string;
+    context?: string;
+  }): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO entity_mentions (entity_id, memory_id, session_id, context)
+      VALUES (?, ?, ?, ?)
+    `);
+    stmt.run(
+      mention.entity_id,
+      mention.memory_id ?? null,
+      mention.session_id,
+      mention.context ?? null,
+    );
+  }
+
+  getEntityMentions(entityId: string, limit: number = 50): DbEntityMention[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM entity_mentions WHERE entity_id = ? ORDER BY created_at DESC LIMIT ?
+    `);
+    return stmt.all(entityId, limit) as DbEntityMention[];
+  }
+
+  upsertEntityRelation(relation: {
+    source_entity_id: string;
+    target_entity_id: string;
+    relation_type: string;
+    weight?: number;
+  }): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO entity_relations (source_entity_id, target_entity_id, relation_type, weight)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(source_entity_id, target_entity_id, relation_type) DO UPDATE SET
+        last_seen = datetime('now'),
+        mention_count = mention_count + 1,
+        weight = MIN(weight + 0.1, 2.0)
+    `);
+    stmt.run(
+      relation.source_entity_id,
+      relation.target_entity_id,
+      relation.relation_type,
+      relation.weight ?? 1.0,
+    );
+  }
+
+  getEntityRelations(entityId: string): DbEntityRelation[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM entity_relations 
+      WHERE source_entity_id = ? OR target_entity_id = ?
+      ORDER BY weight DESC
+    `);
+    return stmt.all(entityId, entityId) as DbEntityRelation[];
+  }
+
+  insertFact(fact: {
+    id: string;
+    memory_id?: string | null;
+    session_id: string;
+    content: string;
+    sector: Sector;
+    confidence?: number;
+    valid_from?: string | null;
+    valid_to?: string | null;
+    metadata_json?: string | null;
+  }): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO facts (id, memory_id, session_id, content, sector, confidence, valid_from, valid_to, metadata_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      fact.id,
+      fact.memory_id ?? null,
+      fact.session_id,
+      fact.content,
+      fact.sector,
+      fact.confidence ?? 0.8,
+      fact.valid_from ?? null,
+      fact.valid_to ?? null,
+      fact.metadata_json ?? null,
+    );
+  }
+
+  getFact(factId: string): DbFact | null {
+    const stmt = this.db.prepare(`SELECT * FROM facts WHERE id = ?`);
+    return stmt.get(factId) as DbFact | null;
+  }
+
+  getCurrentFacts(sessionId?: string, limit: number = 100): DbFact[] {
+    let sql = `SELECT * FROM facts WHERE is_current = 1`;
+    const params: (string | number)[] = [];
+
+    if (sessionId) {
+      sql += ` AND session_id = ?`;
+      params.push(sessionId);
+    }
+
+    sql += ` ORDER BY created_at DESC LIMIT ?`;
+    params.push(limit);
+
+    const stmt = this.db.prepare(sql);
+    return stmt.all(...params) as DbFact[];
+  }
+
+  searchFacts(
+    query: string,
+    limit: number = 20,
+  ): Array<DbFact & { rank: number }> {
+    const stmt = this.db.prepare(`
+      SELECT f.*, bm25(facts_fts) as rank
+      FROM facts_fts
+      JOIN facts f ON facts_fts.rowid = f.rowid
+      WHERE facts_fts MATCH ? AND f.is_current = 1
+      ORDER BY rank
+      LIMIT ?
+    `);
+    return stmt.all(query, limit) as Array<DbFact & { rank: number }>;
+  }
+
+  invalidateFact(factId: string, validTo?: string): void {
+    const stmt = this.db.prepare(`
+      UPDATE facts SET is_current = 0, valid_to = COALESCE(?, datetime('now')) WHERE id = ?
+    `);
+    stmt.run(validTo ?? null, factId);
+  }
+
+  logConsolidation(log: {
+    action: "merge" | "update" | "delete" | "create";
+    source_ids: string[];
+    result_id?: string | null;
+    reason: string;
+  }): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO consolidation_log (action, source_ids, result_id, reason)
+      VALUES (?, ?, ?, ?)
+    `);
+    stmt.run(
+      log.action,
+      JSON.stringify(log.source_ids),
+      log.result_id ?? null,
+      log.reason,
+    );
+  }
+
+  getConsolidationLogs(limit: number = 100): DbConsolidationLog[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM consolidation_log ORDER BY created_at DESC LIMIT ?
+    `);
+    return stmt.all(limit) as DbConsolidationLog[];
+  }
+
+  markMemoryConsolidated(memoryId: string): void {
+    const stmt = this.db.prepare(`
+      UPDATE memories SET is_consolidated = 1 WHERE id = ?
+    `);
+    stmt.run(memoryId);
+  }
+
+  getUnconsolidatedMemories(limit: number = 100): DbMemory[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM memories WHERE is_consolidated = 0 ORDER BY created_at ASC LIMIT ?
+    `);
+    return stmt.all(limit) as DbMemory[];
+  }
+
+  getSimilarMemories(
+    memoryId: string,
+    threshold: number = 0.85,
+  ): Array<{ memory: DbMemory; similarity: number }> {
+    const sourceVectors = this.getMemoryVectors(memoryId);
+    if (sourceVectors.length === 0) return [];
+
+    const allMemories = this.getAllMemoriesWithVectors();
+    const results: Array<{ memory: DbMemory; similarity: number }> = [];
+
+    for (const m of allMemories) {
+      if (m.id === memoryId || m.vectors.length === 0) continue;
+
+      let maxSim = 0;
+      for (const sv of sourceVectors) {
+        for (const tv of m.vectors) {
+          let dot = 0;
+          let normA = 0;
+          let normB = 0;
+          for (let i = 0; i < sv.vector.length; i++) {
+            dot += sv.vector[i] * tv.vector[i];
+            normA += sv.vector[i] * sv.vector[i];
+            normB += tv.vector[i] * tv.vector[i];
+          }
+          const sim = dot / (Math.sqrt(normA) * Math.sqrt(normB));
+          if (sim > maxSim) maxSim = sim;
+        }
+      }
+
+      if (maxSim >= threshold) {
+        results.push({ memory: m, similarity: maxSim });
+      }
+    }
+
+    return results.sort((a, b) => b.similarity - a.similarity);
+  }
+
+  getMemoriesByTimeRange(
+    startDate: string,
+    endDate: string,
+    options: { sector?: Sector; directory?: string; limit?: number } = {},
+  ): DbMemory[] {
+    let sql = `
+      SELECT m.* FROM memories m
+      JOIN sessions s ON m.session_id = s.id
+      WHERE m.created_at >= ? AND m.created_at <= ?
+    `;
+    const params: (string | number)[] = [startDate, endDate];
+
+    if (options.sector) {
+      sql += ` AND m.sector = ?`;
+      params.push(options.sector);
+    }
+
+    if (options.directory) {
+      sql += ` AND s.directory = ?`;
+      params.push(options.directory);
+    }
+
+    sql += ` ORDER BY m.created_at DESC LIMIT ?`;
+    params.push(options.limit || 100);
+
+    const stmt = this.db.prepare(sql);
+    return stmt.all(...params) as DbMemory[];
+  }
+
+  getExtendedStats(): {
+    sessions: number;
+    messages: number;
+    toolCalls: number;
+    memories: number;
+    waypoints: number;
+    entities: number;
+    entityRelations: number;
+    facts: number;
+    consolidations: number;
+  } {
+    const basic = this.getStats();
+    const entities = (
+      this.db.prepare(`SELECT COUNT(*) as count FROM entities`).get() as {
+        count: number;
+      }
+    ).count;
+    const entityRelations = (
+      this.db
+        .prepare(`SELECT COUNT(*) as count FROM entity_relations`)
+        .get() as {
+        count: number;
+      }
+    ).count;
+    const facts = (
+      this.db.prepare(`SELECT COUNT(*) as count FROM facts`).get() as {
+        count: number;
+      }
+    ).count;
+    const consolidations = (
+      this.db
+        .prepare(`SELECT COUNT(*) as count FROM consolidation_log`)
+        .get() as {
+        count: number;
+      }
+    ).count;
+    return { ...basic, entities, entityRelations, facts, consolidations };
   }
 
   close(): void {
