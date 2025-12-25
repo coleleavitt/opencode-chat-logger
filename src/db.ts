@@ -135,6 +135,26 @@ export interface DbEntityRelation {
   mention_count: number;
 }
 
+export interface DbEntityCooccurrence {
+  id: number;
+  entity_a_id: string;
+  entity_b_id: string;
+  memory_id: string;
+  cooccurrence_count: number;
+  first_seen: string;
+  last_seen: string;
+}
+
+export interface DbEntityVector {
+  id: number;
+  entity_id: string;
+  memory_id: string;
+  vector: Uint8Array;
+  dimension: number;
+  context: string;
+  created_at: string;
+}
+
 export interface DbFact {
   id: string;
   memory_id: string | null;
@@ -483,6 +503,41 @@ export class ChatLoggerDb {
       );
 
       CREATE INDEX IF NOT EXISTS idx_consolidation_created ON consolidation_log(created_at);
+
+      -- Entity co-occurrences (entities appearing together in same memory)
+      CREATE TABLE IF NOT EXISTS entity_cooccurrences (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_a_id TEXT NOT NULL,
+        entity_b_id TEXT NOT NULL,
+        memory_id TEXT NOT NULL,
+        cooccurrence_count INTEGER NOT NULL DEFAULT 1,
+        first_seen TEXT NOT NULL DEFAULT (datetime('now')),
+        last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (entity_a_id) REFERENCES entities(id) ON DELETE CASCADE,
+        FOREIGN KEY (entity_b_id) REFERENCES entities(id) ON DELETE CASCADE,
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+        UNIQUE(entity_a_id, entity_b_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_cooccur_entity_a ON entity_cooccurrences(entity_a_id);
+      CREATE INDEX IF NOT EXISTS idx_cooccur_entity_b ON entity_cooccurrences(entity_b_id);
+      CREATE INDEX IF NOT EXISTS idx_cooccur_memory ON entity_cooccurrences(memory_id);
+
+      -- Entity context vectors (embeddings of context where entity appears)
+      CREATE TABLE IF NOT EXISTS entity_vectors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_id TEXT NOT NULL,
+        memory_id TEXT NOT NULL,
+        vector BLOB NOT NULL,
+        dimension INTEGER NOT NULL,
+        context TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_entity_vectors_entity ON entity_vectors(entity_id);
+      CREATE INDEX IF NOT EXISTS idx_entity_vectors_memory ON entity_vectors(memory_id);
     `);
   }
 
@@ -997,6 +1052,202 @@ export class ChatLoggerDb {
       ORDER BY weight DESC
     `);
     return stmt.all(entityId, entityId) as DbEntityRelation[];
+  }
+
+  upsertEntityCooccurrence(
+    entityAId: string,
+    entityBId: string,
+    memoryId: string,
+  ): void {
+    // Ensure consistent ordering (a < b) to avoid duplicates
+    const [first, second] =
+      entityAId < entityBId ? [entityAId, entityBId] : [entityBId, entityAId];
+
+    const stmt = this.db.prepare(`
+      INSERT INTO entity_cooccurrences (entity_a_id, entity_b_id, memory_id)
+      VALUES (?, ?, ?)
+      ON CONFLICT(entity_a_id, entity_b_id) DO UPDATE SET
+        cooccurrence_count = cooccurrence_count + 1,
+        last_seen = datetime('now')
+    `);
+    stmt.run(first, second, memoryId);
+  }
+
+  getEntityCooccurrences(
+    entityId: string,
+    limit: number = 50,
+  ): Array<{ entity_id: string; count: number; last_seen: string }> {
+    const stmt = this.db.prepare(`
+      SELECT 
+        CASE WHEN entity_a_id = ? THEN entity_b_id ELSE entity_a_id END as entity_id,
+        cooccurrence_count as count,
+        last_seen
+      FROM entity_cooccurrences
+      WHERE entity_a_id = ? OR entity_b_id = ?
+      ORDER BY cooccurrence_count DESC
+      LIMIT ?
+    `);
+    return stmt.all(entityId, entityId, entityId, limit) as Array<{
+      entity_id: string;
+      count: number;
+      last_seen: string;
+    }>;
+  }
+
+  getCooccurrencesByMemory(
+    memoryId: string,
+  ): Array<{ entity_a_id: string; entity_b_id: string }> {
+    const stmt = this.db.prepare(`
+      SELECT entity_a_id, entity_b_id FROM entity_cooccurrences WHERE memory_id = ?
+    `);
+    return stmt.all(memoryId) as Array<{
+      entity_a_id: string;
+      entity_b_id: string;
+    }>;
+  }
+
+  insertEntityVector(
+    entityId: string,
+    memoryId: string,
+    vector: Float32Array,
+    context: string,
+  ): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO entity_vectors (entity_id, memory_id, vector, dimension, context)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      entityId,
+      memoryId,
+      new Uint8Array(vector.buffer),
+      vector.length,
+      context,
+    );
+  }
+
+  getEntityVectors(
+    entityId: string,
+  ): Array<{ vector: Float32Array; context: string; memory_id: string }> {
+    const stmt = this.db.prepare(`
+      SELECT vector, dimension, context, memory_id FROM entity_vectors WHERE entity_id = ?
+    `);
+    const rows = stmt.all(entityId) as Array<{
+      vector: Uint8Array;
+      dimension: number;
+      context: string;
+      memory_id: string;
+    }>;
+    return rows.map((r) => ({
+      vector: new Float32Array(
+        r.vector.buffer,
+        r.vector.byteOffset,
+        r.dimension,
+      ),
+      context: r.context,
+      memory_id: r.memory_id,
+    }));
+  }
+
+  getMeanEntityVector(entityId: string): Float32Array | null {
+    const vectors = this.getEntityVectors(entityId);
+    if (vectors.length === 0) return null;
+
+    const dim = vectors[0].vector.length;
+    const mean = new Float32Array(dim);
+
+    for (const v of vectors) {
+      for (let i = 0; i < dim; i++) {
+        mean[i] += v.vector[i];
+      }
+    }
+
+    for (let i = 0; i < dim; i++) {
+      mean[i] /= vectors.length;
+    }
+
+    return mean;
+  }
+
+  findRelatedEntities(
+    entityId: string,
+    options: { limit?: number; minCooccurrence?: number } = {},
+  ): Array<{
+    entity: DbEntity;
+    cooccurrenceCount: number;
+    cooccurrenceScore: number;
+    vectorSimilarity: number;
+    compositeScore: number;
+  }> {
+    const limit = options.limit || 20;
+    const minCooccurrence = options.minCooccurrence || 1;
+
+    const cooccurrences = this.getEntityCooccurrences(entityId, limit * 2);
+    if (cooccurrences.length === 0) return [];
+
+    const sourceVector = this.getMeanEntityVector(entityId);
+
+    const results: Array<{
+      entity: DbEntity;
+      cooccurrenceCount: number;
+      cooccurrenceScore: number;
+      vectorSimilarity: number;
+      compositeScore: number;
+    }> = [];
+
+    const maxCooccurrence = Math.max(...cooccurrences.map((c) => c.count));
+
+    for (const cooc of cooccurrences) {
+      if (cooc.count < minCooccurrence) continue;
+
+      const entity = this.getEntity(cooc.entity_id);
+      if (!entity) continue;
+
+      const cooccurrenceScore = cooc.count / maxCooccurrence;
+
+      let vectorSimilarity = 0;
+      if (sourceVector) {
+        const targetVector = this.getMeanEntityVector(cooc.entity_id);
+        if (targetVector) {
+          let dot = 0;
+          let normA = 0;
+          let normB = 0;
+          for (let i = 0; i < sourceVector.length; i++) {
+            dot += sourceVector[i] * targetVector[i];
+            normA += sourceVector[i] * sourceVector[i];
+            normB += targetVector[i] * targetVector[i];
+          }
+          const denom = Math.sqrt(normA) * Math.sqrt(normB);
+          vectorSimilarity = denom > 0 ? dot / denom : 0;
+        }
+      }
+
+      const COOCCURRENCE_WEIGHT = 0.7;
+      const VECTOR_SIMILARITY_WEIGHT = 0.3;
+      const compositeScore =
+        cooccurrenceScore * COOCCURRENCE_WEIGHT +
+        vectorSimilarity * VECTOR_SIMILARITY_WEIGHT;
+
+      results.push({
+        entity,
+        cooccurrenceCount: cooc.count,
+        cooccurrenceScore,
+        vectorSimilarity,
+        compositeScore,
+      });
+    }
+
+    results.sort((a, b) => b.compositeScore - a.compositeScore);
+
+    return results.slice(0, limit);
+  }
+
+  getEntitiesInMemory(memoryId: string): DbEntity[] {
+    const stmt = this.db.prepare(`
+      SELECT DISTINCT e.* FROM entities e
+      JOIN entity_mentions em ON e.id = em.entity_id
+      WHERE em.memory_id = ?
+    `);
+    return stmt.all(memoryId) as DbEntity[];
   }
 
   insertFact(fact: {

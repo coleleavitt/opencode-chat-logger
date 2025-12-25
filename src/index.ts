@@ -487,7 +487,8 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
     } catch {}
 
     try {
-      const { entities, relations } = extractEntitiesAndRelations(content);
+      const { entities } = extractEntitiesAndRelations(content);
+      const entityIds: string[] = [];
 
       for (const entity of entities) {
         const entityId = crypto.randomUUID();
@@ -500,32 +501,32 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
 
         const existing = db.getEntityByName(entity.name, entity.type);
         if (existing) {
+          entityIds.push(existing.id);
           db.insertEntityMention({
             entity_id: existing.id,
             memory_id: memoryId,
             session_id: sessionId,
             context: entity.context.substring(0, 500),
           });
+
+          try {
+            const emb = await getEmbedder();
+            const contextVector = await emb.embed(
+              entity.context.substring(0, 500),
+            );
+            db.insertEntityVector(
+              existing.id,
+              memoryId,
+              contextVector,
+              entity.context.substring(0, 200),
+            );
+          } catch {}
         }
       }
 
-      for (const relation of relations) {
-        const sourceEntity = db.getEntityByName(
-          relation.sourceEntity.name,
-          relation.sourceEntity.type,
-        );
-        const targetEntity = db.getEntityByName(
-          relation.targetEntity.name,
-          relation.targetEntity.type,
-        );
-
-        if (sourceEntity && targetEntity) {
-          db.upsertEntityRelation({
-            source_entity_id: sourceEntity.id,
-            target_entity_id: targetEntity.id,
-            relation_type: relation.relationType,
-            weight: relation.confidence,
-          });
+      for (let i = 0; i < entityIds.length; i++) {
+        for (let j = i + 1; j < entityIds.length; j++) {
+          db.upsertEntityCooccurrence(entityIds[i], entityIds[j], memoryId);
         }
       }
 
@@ -1496,6 +1497,69 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
           for (const entity of entities) {
             output += `- **${entity.name}** [${entity.type}] - ${entity.mention_count} mentions\n`;
           }
+          return output;
+        },
+      }),
+
+      chat_log_related_entities: tool({
+        description:
+          "Find entities related to a given entity through co-occurrence (appearing together in memories) and semantic similarity.",
+        args: {
+          entity_name: tool.schema
+            .string()
+            .describe("Name of the entity to find relations for"),
+          entity_type: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Entity type to disambiguate (file, class, function, concept, tool, project)",
+            ),
+          limit: tool.schema
+            .number()
+            .optional()
+            .describe("Maximum related entities to return (default: 20)"),
+          min_cooccurrence: tool.schema
+            .number()
+            .optional()
+            .describe("Minimum co-occurrence count (default: 1)"),
+        },
+        async execute(args) {
+          const entity = db.getEntityByName(
+            args.entity_name,
+            args.entity_type as import("./db").EntityType | undefined,
+          );
+
+          if (!entity) {
+            const suggestions = db.searchEntities(args.entity_name, 5);
+            if (suggestions.length > 0) {
+              return `Entity "${args.entity_name}" not found. Did you mean:\n${suggestions.map((s) => `- ${s.name} [${s.type}]`).join("\n")}`;
+            }
+            return `Entity "${args.entity_name}" not found.`;
+          }
+
+          const related = db.findRelatedEntities(entity.id, {
+            limit: args.limit || 20,
+            minCooccurrence: args.min_cooccurrence || 1,
+          });
+
+          if (related.length === 0) {
+            return `No related entities found for "${entity.name}" [${entity.type}]. This entity may not have appeared alongside others in memories yet.`;
+          }
+
+          let output = `## Entities Related to "${entity.name}" [${entity.type}]\n\n`;
+          output += `Found ${related.length} related entities:\n\n`;
+
+          for (const r of related) {
+            output += `### ${r.entity.name} [${r.entity.type}]\n`;
+            output += `- **Co-occurrences**: ${r.cooccurrenceCount}\n`;
+            output += `- **Composite Score**: ${r.compositeScore.toFixed(3)}\n`;
+            output += `- **Co-occurrence Score**: ${r.cooccurrenceScore.toFixed(3)}\n`;
+            if (r.vectorSimilarity > 0) {
+              output += `- **Context Similarity**: ${r.vectorSimilarity.toFixed(3)}\n`;
+            }
+            output += `- **Mentions**: ${r.entity.mention_count}\n\n`;
+          }
+
           return output;
         },
       }),

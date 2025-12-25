@@ -110,54 +110,6 @@ const ENTITY_PATTERNS: EntityPattern[] = [
   },
 ];
 
-const RELATION_PATTERNS = [
-  {
-    pattern: /\b(\w+)\s+(?:imports?|requires?|depends?\s*on|uses?)\s+(\w+)\b/gi,
-    relationType: "imports",
-  },
-  {
-    pattern: /\b(\w+)\s+(?:extends?|inherits?\s*from)\s+(\w+)\b/gi,
-    relationType: "extends",
-  },
-  {
-    pattern: /\b(\w+)\s+(?:implements?|realizes?)\s+(\w+)\b/gi,
-    relationType: "implements",
-  },
-  {
-    pattern: /\b(\w+)\s+(?:calls?|invokes?)\s+(\w+)\b/gi,
-    relationType: "calls",
-  },
-  {
-    pattern: /\b(\w+)\s+(?:returns?|produces?|creates?)\s+(\w+)\b/gi,
-    relationType: "produces",
-  },
-  {
-    pattern: /\b(\w+)\s+(?:contains?|has|includes?)\s+(\w+)\b/gi,
-    relationType: "contains",
-  },
-  {
-    pattern: /use\s+(\w+)\s+(?:for|to\s+(?:do|handle|generate))\s+(\w+)/gi,
-    relationType: "used_for",
-  },
-  {
-    pattern: /(\w+)\s+(?:instead\s+of|rather\s+than|over)\s+(\w+)/gi,
-    relationType: "replaces",
-  },
-  {
-    pattern:
-      /(\w+)\s+(?:connects?\s+to|integrates?\s+with|works?\s+with)\s+(\w+)/gi,
-    relationType: "integrates",
-  },
-  {
-    pattern: /(\w+)\s+(?:stores?|saves?|persists?)\s+(\w+)/gi,
-    relationType: "stores",
-  },
-  {
-    pattern: /(\w+)\s+(?:generates?|embeds?|encodes?)\s+(\w+)/gi,
-    relationType: "generates",
-  },
-];
-
 const COMMON_WORDS = new Set([
   "the",
   "a",
@@ -538,52 +490,10 @@ export function extractEntities(text: string): ExtractedEntity[] {
   return deduplicateEntities(entities);
 }
 
-export function extractRelations(
-  entities: ExtractedEntity[],
-  text: string,
-): ExtractedRelation[] {
-  const relations: ExtractedRelation[] = [];
-  const entityMap = new Map<string, ExtractedEntity>();
-
-  for (const entity of entities) {
-    entityMap.set(entity.name.toLowerCase(), entity);
-  }
-
-  for (const { pattern, relationType } of RELATION_PATTERNS) {
-    const clonedPattern = new RegExp(pattern.source, pattern.flags);
-    let match: RegExpExecArray | null;
-
-    while ((match = clonedPattern.exec(text)) !== null) {
-      const sourceName = match[1]?.toLowerCase();
-      const targetName = match[2]?.toLowerCase();
-
-      if (!sourceName || !targetName) continue;
-
-      const sourceEntity = entityMap.get(sourceName);
-      const targetEntity = entityMap.get(targetName);
-
-      if (sourceEntity && targetEntity) {
-        relations.push({
-          sourceEntity,
-          targetEntity,
-          relationType,
-          confidence: Math.min(
-            sourceEntity.confidence,
-            targetEntity.confidence,
-          ),
-        });
-      }
-    }
-  }
-
-  return relations;
-}
-
 export function extractEntitiesAndRelations(text: string): {
   entities: ExtractedEntity[];
   relations: ExtractedRelation[];
 } {
   const entities = extractEntities(text);
-  const relations = extractRelations(entities, text);
-  return { entities, relations };
+  return { entities, relations: [] };
 }
