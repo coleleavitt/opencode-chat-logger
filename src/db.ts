@@ -118,6 +118,18 @@ export class ChatLoggerDb {
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.initSchema();
+    this.runMigrations();
+  }
+
+  private runMigrations(): void {
+    const columns = this.db
+      .prepare("PRAGMA table_info(sessions)")
+      .all() as Array<{ name: string }>;
+    const hasColumn = (name: string) => columns.some((c) => c.name === name);
+
+    if (!hasColumn("summary")) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN summary TEXT");
+    }
   }
 
   private initSchema(): void {
