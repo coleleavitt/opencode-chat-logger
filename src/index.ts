@@ -16,7 +16,7 @@ import {
   reinforceRetrievedMemories,
   formatMemoriesForContext,
 } from "./scoring";
-import { createWaypointsForMemory } from "./graph";
+import { createWaypointsForMemory, traverseFromMemory } from "./graph";
 
 // ============================================================================
 // Configuration
@@ -1099,6 +1099,206 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
             return output;
           } catch (e) {
             return `Error finding context: ${e}`;
+          }
+        },
+      }),
+
+      chat_log_semantic_search: tool({
+        description:
+          "Search memories using semantic similarity (vector-based). Returns memories ranked by composite score combining similarity, salience, recency, and associative links.",
+        args: {
+          query: tool.schema
+            .string()
+            .describe(
+              "Natural language query to search for semantically similar memories",
+            ),
+          limit: tool.schema
+            .number()
+            .optional()
+            .describe("Maximum results (default: 10)"),
+          min_similarity: tool.schema
+            .number()
+            .optional()
+            .describe("Minimum similarity threshold 0-1 (default: 0.3)"),
+          sector: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Filter by sector: code_change, debugging, architecture, discussion, procedural",
+            ),
+        },
+        async execute(args) {
+          try {
+            const emb = await getEmbedder();
+            const sectors = args.sector ? [args.sector as Sector] : undefined;
+
+            const results = await searchMemories(db, emb, args.query, {
+              limit: args.limit || 10,
+              minSimilarity: args.min_similarity || 0.3,
+              sectors,
+            });
+
+            if (results.length === 0) {
+              return `No memories found matching "${args.query}" (similarity threshold: ${args.min_similarity || 0.3})`;
+            }
+
+            let output = `## Semantic Search Results for "${args.query}"\n\n`;
+            output += `Found ${results.length} relevant memories:\n\n`;
+
+            for (const scored of results) {
+              const m = scored.memory;
+              output += `### [${m.sector}] Score: ${scored.compositeScore.toFixed(3)}\n`;
+              output += `- **Similarity**: ${scored.similarity.toFixed(3)}\n`;
+              output += `- **Salience**: ${scored.effectiveSalience.toFixed(3)} (base: ${m.salience.toFixed(3)})\n`;
+              output += `- **Recency**: ${scored.recencyScore.toFixed(3)}\n`;
+              output += `- **Waypoint Boost**: ${scored.waypointBoost.toFixed(3)}\n`;
+              output += `- **Access Count**: ${m.access_count}\n`;
+              output += `- **Last Accessed**: ${m.last_accessed}\n\n`;
+              output += `> ${m.content.substring(0, 500)}${m.content.length > 500 ? "..." : ""}\n\n`;
+              output += `---\n\n`;
+            }
+
+            return output;
+          } catch (e) {
+            return `Error in semantic search: ${e}`;
+          }
+        },
+      }),
+
+      chat_log_memory_prune: tool({
+        description:
+          "Prune decayed memories below a salience threshold. Memories naturally decay based on their sector (architecture decays slowest, debugging fastest).",
+        args: {
+          threshold: tool.schema
+            .number()
+            .optional()
+            .describe(
+              "Salience threshold below which to prune (default: 0.01)",
+            ),
+          dry_run: tool.schema
+            .boolean()
+            .optional()
+            .describe(
+              "Preview what would be pruned without actually deleting (default: true)",
+            ),
+        },
+        async execute(args) {
+          const threshold = args.threshold || 0.01;
+          const dryRun = args.dry_run !== false;
+
+          try {
+            const allMemories = db.getAllMemoriesWithVectors();
+            const toPrune: Array<{
+              id: string;
+              sector: Sector;
+              salience: number;
+              content: string;
+            }> = [];
+
+            for (const memory of allMemories) {
+              const effectiveSalience = db.getDecayedSalience(memory);
+              if (effectiveSalience < threshold) {
+                toPrune.push({
+                  id: memory.id,
+                  sector: memory.sector,
+                  salience: effectiveSalience,
+                  content: memory.content.substring(0, 100),
+                });
+              }
+            }
+
+            if (toPrune.length === 0) {
+              return `No memories below threshold ${threshold}. All ${allMemories.length} memories are above the salience threshold.`;
+            }
+
+            let output = `## Memory Pruning ${dryRun ? "(DRY RUN)" : ""}\n\n`;
+            output += `Found ${toPrune.length} memories below salience threshold ${threshold}:\n\n`;
+
+            const bySector = new Map<Sector, number>();
+            for (const m of toPrune) {
+              bySector.set(m.sector, (bySector.get(m.sector) || 0) + 1);
+            }
+
+            output += `### By Sector:\n`;
+            for (const [sector, count] of bySector) {
+              output += `- ${sector}: ${count}\n`;
+            }
+            output += `\n`;
+
+            if (!dryRun) {
+              const pruned = db.pruneDecayedMemories(threshold);
+              output += `**Pruned ${pruned} memories.**\n`;
+            } else {
+              output += `_Run with dry_run=false to actually prune these memories._\n\n`;
+              output += `### Preview (first 10):\n`;
+              for (const m of toPrune.slice(0, 10)) {
+                output += `- [${m.sector}] salience=${m.salience.toFixed(4)}: ${m.content}...\n`;
+              }
+            }
+
+            return output;
+          } catch (e) {
+            return `Error pruning memories: ${e}`;
+          }
+        },
+      }),
+
+      chat_log_related_memories: tool({
+        description:
+          "Explore the memory graph by finding memories related to a given memory through waypoint links.",
+        args: {
+          memory_id: tool.schema
+            .string()
+            .describe("Memory ID to find related memories for"),
+          depth: tool.schema
+            .number()
+            .optional()
+            .describe("Maximum traversal depth (default: 2)"),
+          limit: tool.schema
+            .number()
+            .optional()
+            .describe("Maximum related memories to return (default: 10)"),
+        },
+        async execute(args) {
+          try {
+            const memory = db.getMemory(args.memory_id);
+            if (!memory) {
+              return `Memory ${args.memory_id} not found.`;
+            }
+
+            const graph = traverseFromMemory(
+              db,
+              args.memory_id,
+              args.depth || 2,
+              (args.limit || 10) + 1,
+            );
+
+            let output = `## Related Memories for [${memory.sector}]\n\n`;
+            output += `**Source Memory**: ${memory.content.substring(0, 200)}...\n\n`;
+            output += `Found ${graph.nodes.length - 1} related memories across ${graph.edges.length} links:\n\n`;
+
+            const byDepth = new Map<number, typeof graph.nodes>();
+            for (const node of graph.nodes) {
+              if (node.id === args.memory_id) continue;
+              const existing = byDepth.get(node.depth) || [];
+              existing.push(node);
+              byDepth.set(node.depth, existing);
+            }
+
+            for (const [depth, nodes] of [...byDepth.entries()].sort(
+              (a, b) => a[0] - b[0],
+            )) {
+              output += `### Depth ${depth} (${nodes.length} memories)\n\n`;
+              for (const node of nodes) {
+                const m = node.memory;
+                output += `- **[${m.sector}]** (id: ${m.id.substring(0, 8)}...)\n`;
+                output += `  > ${m.content.substring(0, 150)}...\n\n`;
+              }
+            }
+
+            return output;
+          } catch (e) {
+            return `Error finding related memories: ${e}`;
           }
         },
       }),
