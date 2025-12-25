@@ -4,7 +4,11 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { ChatLoggerDb, type Sector } from "./db";
-import { createEmbeddingProvider, type EmbeddingProvider } from "./embedding";
+import {
+  createEmbeddingProvider,
+  type EmbeddingProvider,
+  type ToastCallback,
+} from "./embedding";
 import {
   classifySector,
   classifyFromToolCall,
@@ -364,10 +368,28 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
 
   const db = new ChatLoggerDb(logDir);
 
+  const showToast: ToastCallback = (message: string) => {
+    input.client?.tui?.showToast?.({
+      body: {
+        message,
+        variant: "warning",
+        duration: 5000,
+      },
+    });
+  };
+
+  const workerPath = path.join(
+    path.dirname(import.meta.path),
+    "embed-worker.ts",
+  );
+
   let embedder: EmbeddingProvider | null = null;
   const getEmbedder = async (): Promise<EmbeddingProvider> => {
     if (!embedder) {
-      embedder = await createEmbeddingProvider("ollama");
+      embedder = await createEmbeddingProvider({
+        toast: showToast,
+        workerPath,
+      });
     }
     return embedder;
   };

@@ -6,6 +6,8 @@ export interface EmbeddingProvider {
   dimension: number;
 }
 
+export type ToastCallback = (message: string) => void;
+
 export interface OllamaEmbeddingConfig {
   model?: string;
   baseUrl?: string;
@@ -94,6 +96,114 @@ export class SyntheticEmbedding implements EmbeddingProvider {
   }
 }
 
+interface WorkerResponse {
+  id: string;
+  embedding?: number[];
+  error?: string;
+}
+
+export class SubprocessEmbedding implements EmbeddingProvider {
+  dimension: number = 384;
+  private proc: ReturnType<typeof Bun.spawn> | null = null;
+  private pending = new Map<
+    string,
+    { resolve: (v: Float32Array) => void; reject: (e: Error) => void }
+  >();
+  private buffer = "";
+  private workerPath: string;
+  private starting: Promise<void> | null = null;
+
+  constructor(workerPath: string) {
+    this.workerPath = workerPath;
+  }
+
+  private async ensureProcess(): Promise<void> {
+    if (this.proc) return;
+    if (this.starting) return this.starting;
+
+    this.starting = (async () => {
+      this.proc = Bun.spawn(["bun", "run", this.workerPath], {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+
+      this.readLoop();
+    })();
+
+    await this.starting;
+    this.starting = null;
+  }
+
+  private async readLoop(): Promise<void> {
+    const stdout = this.proc?.stdout;
+    if (!stdout || typeof stdout === "number") return;
+
+    const reader = stdout.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      this.buffer += decoder.decode(value, { stream: true });
+      const lines = this.buffer.split("\n");
+      this.buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const res: WorkerResponse = JSON.parse(line);
+          const handler = this.pending.get(res.id);
+          if (handler) {
+            this.pending.delete(res.id);
+            if (res.error) {
+              handler.reject(new Error(res.error));
+            } else if (res.embedding) {
+              handler.resolve(new Float32Array(res.embedding));
+            }
+          }
+        } catch {}
+      }
+    }
+  }
+
+  async embed(text: string): Promise<Float32Array> {
+    await this.ensureProcess();
+    const stdin = this.proc?.stdin;
+    if (!stdin || typeof stdin === "number")
+      throw new Error("Worker process not available");
+
+    const id = crypto.randomUUID();
+    const request = JSON.stringify({ id, text }) + "\n";
+
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      stdin.write(request);
+
+      setTimeout(() => {
+        if (this.pending.has(id)) {
+          this.pending.delete(id);
+          reject(new Error("Embedding request timed out"));
+        }
+      }, 30000);
+    });
+  }
+
+  async embedBatch(texts: string[]): Promise<Float32Array[]> {
+    const results: Float32Array[] = [];
+    for (const text of texts) {
+      results.push(await this.embed(text));
+    }
+    return results;
+  }
+
+  shutdown(): void {
+    this.proc?.kill();
+    this.proc = null;
+  }
+}
+
 export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
   if (a.length !== b.length) return 0;
 
@@ -169,21 +279,33 @@ export async function embedMultiSector(
   return results;
 }
 
+export interface EmbeddingProviderOptions {
+  toast?: ToastCallback;
+  ollamaConfig?: OllamaEmbeddingConfig;
+  workerPath?: string;
+}
+
 export async function createEmbeddingProvider(
-  type: "ollama" | "synthetic" = "ollama",
-  config?: OllamaEmbeddingConfig,
+  options: EmbeddingProviderOptions = {},
 ): Promise<EmbeddingProvider> {
-  if (type === "ollama") {
-    const provider = new OllamaEmbedding(config);
+  const { toast, ollamaConfig, workerPath } = options;
+
+  if (workerPath) {
     try {
-      await provider.embed("test");
-      return provider;
-    } catch {
-      console.warn(
-        "Ollama not available, falling back to synthetic embeddings",
-      );
-      return new SyntheticEmbedding();
-    }
+      const subprocess = new SubprocessEmbedding(workerPath);
+      await subprocess.embed("test");
+      return subprocess;
+    } catch {}
+  }
+
+  try {
+    const ollama = new OllamaEmbedding(ollamaConfig);
+    await ollama.embed("test");
+    return ollama;
+  } catch {}
+
+  if (toast) {
+    toast("Using synthetic embeddings (local ML and Ollama unavailable)");
   }
   return new SyntheticEmbedding();
 }
