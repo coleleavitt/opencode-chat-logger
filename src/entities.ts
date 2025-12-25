@@ -83,6 +83,28 @@ const ENTITY_PATTERNS: EntityPattern[] = [
       /\b(API|REST|GraphQL|WebSocket|OAuth|JWT|CORS|SSR|CSR|SSG|ISR)\b/g,
       /\b(microservices?|monolith|serverless|event[- ]driven|CQRS|DDD|clean\s*architecture)\b/gi,
       /\b(SQL|NoSQL|PostgreSQL|MySQL|MongoDB|Redis|Elasticsearch|DynamoDB)\b/g,
+      // AI/ML concepts
+      /\b(embeddings?|vectors?|semantic\s*search|RAG|LLM|transformers?|attention|tokeniz(?:er|ation))\b/gi,
+      /\b(cosine\s*similarity|similarity\s*search|nearest\s*neighbor|KNN|HNSW|IVF)\b/gi,
+      /\b(prompt(?:ing)?|fine[- ]?tun(?:e|ing)|inference|model)\b/gi,
+      // Memory/storage concepts
+      /\b(memory\s*(?:tier|consolidation|pruning|waypoints?)|salience|decay)\b/gi,
+    ],
+    contextWindow: 80,
+  },
+  {
+    type: "project",
+    patterns: [
+      // GitHub repos: owner/repo format
+      /\b([a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+)\b/g,
+      // Known AI/ML libraries
+      /\b(ollama|openai|anthropic|langchain|llamaindex|chromadb|pinecone|qdrant|weaviate|milvus)\b/gi,
+      /\b(huggingface|transformers\.js|sentence[- ]?transformers|faiss|annoy)\b/gi,
+      // Known npm packages (with dots or hyphens)
+      /\b(better-sqlite3|drizzle-orm|prisma|typeorm|sequelize|knex)\b/gi,
+      /\b(opencode|opencode-chat-logger|oh-my-opencode|openmemory|cognee)\b/gi,
+      // Package manager install patterns: "install X", "add X"
+      /(?:npm|yarn|bun|pnpm|cargo|pip)\s+(?:install|add|i)\s+([a-zA-Z0-9@/_.-]+)/gi,
     ],
     contextWindow: 80,
   },
@@ -112,6 +134,27 @@ const RELATION_PATTERNS = [
   {
     pattern: /\b(\w+)\s+(?:contains?|has|includes?)\s+(\w+)\b/gi,
     relationType: "contains",
+  },
+  {
+    pattern: /use\s+(\w+)\s+(?:for|to\s+(?:do|handle|generate))\s+(\w+)/gi,
+    relationType: "used_for",
+  },
+  {
+    pattern: /(\w+)\s+(?:instead\s+of|rather\s+than|over)\s+(\w+)/gi,
+    relationType: "replaces",
+  },
+  {
+    pattern:
+      /(\w+)\s+(?:connects?\s+to|integrates?\s+with|works?\s+with)\s+(\w+)/gi,
+    relationType: "integrates",
+  },
+  {
+    pattern: /(\w+)\s+(?:stores?|saves?|persists?)\s+(\w+)/gi,
+    relationType: "stores",
+  },
+  {
+    pattern: /(\w+)\s+(?:generates?|embeds?|encodes?)\s+(\w+)/gi,
+    relationType: "generates",
   },
 ];
 
