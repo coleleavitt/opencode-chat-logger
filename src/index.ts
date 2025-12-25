@@ -1996,7 +1996,7 @@ Use \`chat_log_list directory="${input.directory}"\` to see all sessions for thi
           `Session with ${messages.length} messages. Topics: ${relevantMemories.map((m) => m.memory.sector).join(", ")}`,
         );
 
-        runConsolidationPass(db, 5);
+        // runConsolidationPass(db, 5);
         runTierPromotion(db, 10);
       } catch {}
     },
