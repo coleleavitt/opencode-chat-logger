@@ -3,7 +3,20 @@ import { tool } from "@opencode-ai/plugin";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { ChatLoggerDb } from "./db";
+import { ChatLoggerDb, type Sector } from "./db";
+import { createEmbeddingProvider, type EmbeddingProvider } from "./embedding";
+import {
+  classifySector,
+  classifyFromToolCall,
+  getSectorDecayRate,
+  estimateInitialSalience,
+} from "./sectors";
+import {
+  searchMemories,
+  reinforceRetrievedMemories,
+  formatMemoriesForContext,
+} from "./scoring";
+import { createWaypointsForMemory } from "./graph";
 
 // ============================================================================
 // Configuration
@@ -351,6 +364,59 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
 
   const db = new ChatLoggerDb(logDir);
 
+  let embedder: EmbeddingProvider | null = null;
+  const getEmbedder = async (): Promise<EmbeddingProvider> => {
+    if (!embedder) {
+      embedder = await createEmbeddingProvider("ollama");
+    }
+    return embedder;
+  };
+
+  const createMemoryFromContent = async (
+    sessionId: string,
+    content: string,
+    metadata?: {
+      isUserMessage?: boolean;
+      hasCodeBlock?: boolean;
+      toolCount?: number;
+    },
+  ): Promise<string | null> => {
+    if (content.length < 50) return null;
+
+    const classification = classifySector(content);
+    const salience = estimateInitialSalience(
+      content,
+      classification.sector,
+      metadata,
+    );
+    const decayRate = getSectorDecayRate(classification.sector);
+
+    const memoryId = crypto.randomUUID();
+
+    db.insertMemory({
+      id: memoryId,
+      session_id: sessionId,
+      content: content.substring(0, 2000),
+      sector: classification.sector,
+      salience,
+      decay_lambda: decayRate,
+      metadata_json: JSON.stringify({
+        confidence: classification.confidence,
+        secondarySectors: classification.secondarySectors,
+      }),
+    });
+
+    try {
+      const emb = await getEmbedder();
+      const vector = await emb.embed(content.substring(0, 1000));
+      db.insertMemoryVector(memoryId, classification.sector, vector);
+
+      await createWaypointsForMemory(db, memoryId);
+    } catch {}
+
+    return memoryId;
+  };
+
   const ensureDirs = () => {
     for (const dir of [logDir, sessionsDir, eventsDir]) {
       if (!fs.existsSync(dir)) {
@@ -615,6 +681,8 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
             `- **Sessions**: ${stats.sessions}\n` +
             `- **Messages**: ${stats.messages}\n` +
             `- **Tool Calls**: ${stats.toolCalls}\n` +
+            `- **Memories**: ${stats.memories}\n` +
+            `- **Waypoints**: ${stats.waypoints}\n` +
             `- **Database Size**: ${dbSize}\n` +
             `- **Log Directory**: ${logDir}\n`
           );
@@ -1162,6 +1230,15 @@ Use \`chat_log_list directory="${input.directory}"\` to see all sessions for thi
         last_model: modelStr,
       });
       db.incrementMessageCount(sessionID);
+
+      if (message.role === "user" && contentStr.length > 100) {
+        const toolCount = parts.filter((p) => p.type === "tool").length;
+        createMemoryFromContent(sessionID, contentStr, {
+          isUserMessage: true,
+          hasCodeBlock: contentStr.includes("```"),
+          toolCount,
+        }).catch(() => {});
+      }
     },
 
     "tool.execute.before": async (input, output) => {
@@ -1214,6 +1291,60 @@ Use \`chat_log_list directory="${input.directory}"\` to see all sessions for thi
         title: title ?? null,
         metadata_json: metadata ? JSON.stringify(metadata) : null,
       });
+    },
+
+    "experimental.session.compacting": async (input, output) => {
+      const { sessionID } = input;
+
+      try {
+        const session = db.getSession(sessionID);
+        if (!session) return;
+
+        const messages = db.getSessionMessages(sessionID);
+        const recentContent = messages
+          .slice(-10)
+          .map((m) => m.content)
+          .join("\n");
+
+        if (recentContent.length < 100) return;
+
+        const emb = await getEmbedder();
+        const relevantMemories = await searchMemories(db, emb, recentContent, {
+          limit: 5,
+          minSimilarity: 0.4,
+          minSalience: 0.05,
+        });
+
+        if (relevantMemories.length === 0) return;
+
+        reinforceRetrievedMemories(db, relevantMemories, 0.1);
+
+        const contextStr = formatMemoriesForContext(relevantMemories, 3000);
+
+        output.context.push(
+          "## Relevant Context from Past Sessions\n\n" +
+            "The following memories from previous sessions may be relevant:\n\n" +
+            contextStr,
+        );
+
+        const sessionSummary = messages
+          .filter((m) => m.role === "user")
+          .slice(-5)
+          .map((m) => m.content.substring(0, 200))
+          .join(" | ");
+
+        if (sessionSummary.length > 100) {
+          await createMemoryFromContent(sessionID, sessionSummary, {
+            isUserMessage: true,
+            hasCodeBlock: sessionSummary.includes("```"),
+          });
+        }
+
+        db.updateSessionSummary(
+          sessionID,
+          `Session with ${messages.length} messages. Topics: ${relevantMemories.map((m) => m.memory.sector).join(", ")}`,
+        );
+      } catch {}
     },
   };
 };
