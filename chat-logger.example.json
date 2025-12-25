@@ -1,0 +1,6 @@
+{
+  "logDir": "~/.local/share/opencode/chat-logs",
+  "retentionDays": 30,
+  "enableEventLog": true,
+  "maxToolOutputLength": 10000
+}
