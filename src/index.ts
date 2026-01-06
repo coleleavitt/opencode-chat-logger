@@ -376,8 +376,9 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
 
   const sessionMetadataCache = new Map<string, SessionMetadata>();
 
-  // Track current session for hooks that don't receive sessionID
   let currentSessionID: string | null = null;
+
+  const processedMessageIds = new Set<string>();
 
   let activeMemoryCreations = 0;
   const MAX_CONCURRENT_MEMORY_CREATIONS = 3;
@@ -2208,19 +2209,20 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
     },
 
     "experimental.chat.messages.transform": async (_input, output) => {
-      const seenMessageIds = new Set<string>();
-      
       for (const msg of output.messages) {
         if (msg.info.role !== "assistant") continue;
-        if (seenMessageIds.has(msg.info.id)) continue;
-        
-        seenMessageIds.add(msg.info.id);
+        if (processedMessageIds.has(msg.info.id)) continue;
         
         const sessionID = (msg.info as { sessionID?: string }).sessionID;
         if (!sessionID) continue;
         
         const existingMsg = db.getMessage(msg.info.id);
-        if (existingMsg) continue;
+        if (existingMsg) {
+          processedMessageIds.add(msg.info.id);
+          continue;
+        }
+        
+        processedMessageIds.add(msg.info.id);
         
         const textParts = msg.parts.filter((p: { type: string }) => p.type === "text");
         const contentStr = textParts
