@@ -520,15 +520,26 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
       const entityNameToId = new Map<string, string>();
 
       for (const entity of entities) {
-        const entityId = crypto.randomUUID();
-        db.upsertEntity({
-          id: entityId,
-          name: entity.name,
-          type: entity.type,
-          metadata_json: JSON.stringify({ confidence: entity.confidence }),
-        });
+        let existing = db.getEntityByName(entity.name, entity.type);
+        
+        if (!existing) {
+          const entityId = crypto.randomUUID();
+          db.upsertEntity({
+            id: entityId,
+            name: entity.name,
+            type: entity.type,
+            metadata_json: JSON.stringify({ confidence: entity.confidence }),
+          });
+          existing = db.getEntityByName(entity.name, entity.type);
+        } else {
+          db.upsertEntity({
+            id: existing.id,
+            name: entity.name,
+            type: entity.type,
+            metadata_json: JSON.stringify({ confidence: entity.confidence }),
+          });
+        }
 
-        const existing = db.getEntityByName(entity.name, entity.type);
         if (existing) {
           entityIds.push(existing.id);
           entityNameToId.set(entity.name.toLowerCase(), existing.id);
