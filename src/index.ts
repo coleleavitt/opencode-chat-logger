@@ -1975,7 +1975,12 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
         for (const agentName of Object.keys(agents)) {
           const agent = agents[agentName];
           if (agent && typeof agent.prompt === "string") {
-            agent.prompt = agent.prompt + memoryContext;
+            try {
+              (cfg.agent as Record<string, AgentConfig>)[agentName] = {
+                ...agent,
+                prompt: agent.prompt + memoryContext,
+              };
+            } catch {}
           }
         }
       }
