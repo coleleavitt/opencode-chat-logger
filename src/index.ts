@@ -332,6 +332,7 @@ function exportSessionToMarkdown(
 function listSessions(
   sessionsDir: string,
   limit: number = 50,
+  directory?: string,
 ): SessionMetadata[] {
   if (!fs.existsSync(sessionsDir)) return [];
 
@@ -348,6 +349,7 @@ function listSessions(
         const metadata: SessionMetadata = JSON.parse(
           fs.readFileSync(metadataFile, "utf-8"),
         );
+        if (directory && metadata.directory !== directory) continue;
         sessions.push(metadata);
       } catch {}
     }
@@ -820,7 +822,7 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
             return output;
           }
 
-          const sessions = listSessions(sessionsDir, args.limit || 50);
+          const sessions = listSessions(sessionsDir, args.limit || 50, args.directory);
 
           if (sessions.length === 0) {
             return "No chat sessions found.";
