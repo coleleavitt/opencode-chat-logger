@@ -874,6 +874,11 @@ export class ChatLoggerDb {
     return stmt.get(sessionId) as DbSession | null;
   }
 
+  getMessage(messageId: string): DbMessage | null {
+    const stmt = this.db.prepare(`SELECT * FROM messages WHERE id = ?`);
+    return stmt.get(messageId) as DbMessage | null;
+  }
+
   getSessionMessages(sessionId: string): DbMessage[] {
     const stmt = this.db.prepare(
       `SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC`,
@@ -1554,6 +1559,7 @@ export class ChatLoggerDb {
     waypoints: number;
     entities: number;
     entityRelations: number;
+    entityCooccurrences: number;
     facts: number;
     consolidations: number;
   } {
@@ -1570,6 +1576,13 @@ export class ChatLoggerDb {
         count: number;
       }
     ).count;
+    const entityCooccurrences = (
+      this.db
+        .prepare(`SELECT COUNT(*) as count FROM entity_cooccurrences`)
+        .get() as {
+        count: number;
+      }
+    ).count;
     const facts = (
       this.db.prepare(`SELECT COUNT(*) as count FROM facts`).get() as {
         count: number;
@@ -1582,7 +1595,7 @@ export class ChatLoggerDb {
         count: number;
       }
     ).count;
-    return { ...basic, entities, entityRelations, facts, consolidations };
+    return { ...basic, entities, entityRelations, entityCooccurrences, facts, consolidations };
   }
 
   close(): void {

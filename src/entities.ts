@@ -20,6 +20,12 @@ interface EntityPattern {
   contextWindow: number;
 }
 
+interface RelationPattern {
+  relationType: string;
+  patterns: RegExp[];
+  confidence: number;
+}
+
 const ENTITY_PATTERNS: EntityPattern[] = [
   {
     type: "file",
@@ -107,6 +113,310 @@ const ENTITY_PATTERNS: EntityPattern[] = [
       /(?:npm|yarn|bun|pnpm|cargo|pip)\s+(?:install|add|i)\s+([a-zA-Z0-9@/_.-]+)/gi,
     ],
     contextWindow: 80,
+  },
+];
+
+const RELATION_PATTERNS: RelationPattern[] = [
+  // === CODE SYNTAX PATTERNS (two-capture) ===
+  {
+    relationType: "imports",
+    patterns: [
+      /\bimport\s+(?:\{[^}]+\}|[a-zA-Z_][a-zA-Z0-9_]*|\*)\s+from\s+['"]([^'"]+)['"]/g,
+      /\bfrom\s+['"]([^'"]+)['"]\s+import\b/g,
+      /\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
+    ],
+    confidence: 0.9,
+  },
+  {
+    relationType: "extends",
+    patterns: [
+      /\bclass\s+([A-Z][a-zA-Z0-9_]*)\s+extends\s+([A-Z][a-zA-Z0-9_]*)\b/g,
+    ],
+    confidence: 0.95,
+  },
+  {
+    relationType: "implements",
+    patterns: [
+      /\bclass\s+([A-Z][a-zA-Z0-9_]*)\s+implements\s+([A-Z][a-zA-Z0-9_,\s]*)\b/g,
+    ],
+    confidence: 0.95,
+  },
+
+  // === NATURAL LANGUAGE TWO-CAPTURE PATTERNS ===
+
+  // "added X to Y", "add X in Y"
+  {
+    relationType: "added_to",
+    patterns: [
+      /\badd(?:s|ed|ing)?\s+`?([a-zA-Z_][a-zA-Z0-9_()]*)`?\s+to\s+`?([a-zA-Z0-9_./-]+)`?/gi,
+      /\badd(?:s|ed|ing)?\s+`?([a-zA-Z_][a-zA-Z0-9_()]*)`?\s+(?:in|into)\s+`?([a-zA-Z0-9_./-]+)`?/gi,
+      /\badd(?:s|ed|ing)?\s+`([^`]+)`\s+to\s+`([^`]+)`/gi,
+      /\badd(?:s|ed|ing)?\s+`([^`]+)`\s+(?:in|into)\s+`([^`]+)`/gi,
+    ],
+    confidence: 0.8,
+  },
+
+  // "X in Y" - function/method in file
+  {
+    relationType: "defined_in",
+    patterns: [
+      /`([a-zA-Z_][a-zA-Z0-9_()]*)`\s+(?:in|inside|within)\s+`([a-zA-Z0-9_./-]+)`/gi,
+      /`([a-zA-Z_][a-zA-Z0-9_()]*)`\s+(?:function|method|class)\s+(?:in|inside)\s+`([a-zA-Z0-9_./-]+)`/gi,
+      /(?:function|method|class)\s+`([a-zA-Z_][a-zA-Z0-9_()]*)`\s+(?:in|inside)\s+`([a-zA-Z0-9_./-]+)`/gi,
+      // Without backticks - match "X in src/path.ts" or "X in path.ts"
+      /\b([a-zA-Z_][a-zA-Z0-9_()]*)\s+(?:in|inside|within)\s+((?:src|lib|packages?)\/[a-zA-Z0-9_.\/-]+\.[a-z]{2,4})/gi,
+      /\b([a-zA-Z_][a-zA-Z0-9_()]*)\s+(?:in|inside|within)\s+([a-zA-Z0-9_.\/-]+\.[tj]sx?)/gi,
+    ],
+    confidence: 0.8,
+  },
+
+  // "Created X" where X is a file path (two-capture: action target + file)
+  {
+    relationType: "created_in",
+    patterns: [
+      // "Created src/file.ts", "created lib/module.js"
+      /\bcreat(?:e|es|ed|ing)\s+((?:src|lib|packages?|scripts?)\/[a-zA-Z0-9_.\/-]+\.[a-z]{2,4})/gi,
+      // "Created `src/file.ts`"
+      /\bcreat(?:e|es|ed|ing)\s+`([^`]+\.[a-z]{2,4})`/gi,
+    ],
+    confidence: 0.75,
+  },
+
+  // "Modified/Updated/Fixed X" where X is a file path
+  {
+    relationType: "modified_file",
+    patterns: [
+      /\b(?:modif(?:y|ies|ied|ying)|updat(?:e|es|ed|ing)|fix(?:es|ed|ing)?|edit(?:s|ed|ing)?)\s+((?:src|lib|packages?)\/[a-zA-Z0-9_.\/-]+\.[a-z]{2,4})/gi,
+      /\b(?:modif(?:y|ies|ied|ying)|updat(?:e|es|ed|ing)|fix(?:es|ed|ing)?|edit(?:s|ed|ing)?)\s+`([^`]+\.[a-z]{2,4})`/gi,
+    ],
+    confidence: 0.75,
+  },
+
+  // "change X to Y", "replace X with Y", "rename X to Y"
+  {
+    relationType: "replaced_by",
+    patterns: [
+      /\bchang(?:e|es|ing|ed)\s+`([^`]+)`\s+to\s+`([^`]+)`/gi,
+      /\breplac(?:e|es|ing|ed)\s+`([^`]+)`\s+with\s+`([^`]+)`/gi,
+      /\brenam(?:e|es|ing|ed)\s+`([^`]+)`\s+to\s+`([^`]+)`/gi,
+      /\bchang(?:e|es|ing|ed)\s+`?([a-zA-Z_][a-zA-Z0-9_./-]*)`?\s+to\s+`?([a-zA-Z_][a-zA-Z0-9_./-]*)`?/gi,
+    ],
+    confidence: 0.85,
+  },
+
+  // "X uses Y", "X with Y"
+  {
+    relationType: "uses",
+    patterns: [
+      /`([a-zA-Z_][a-zA-Z0-9_]*)`\s+uses\s+`([a-zA-Z_][a-zA-Z0-9_]*)`/gi,
+      /`([a-zA-Z_][a-zA-Z0-9_]*)`\s+(?:using|with)\s+`([a-zA-Z_][a-zA-Z0-9_]*)`/gi,
+      /\busing\s+`?([a-zA-Z_][a-zA-Z0-9_./-]*)`?\s+(?:in|for|with)\s+`?([a-zA-Z0-9_./-]+)`?/gi,
+    ],
+    confidence: 0.7,
+  },
+
+  // "X calls Y", "X invokes Y"
+  {
+    relationType: "calls",
+    patterns: [
+      /`([a-zA-Z_][a-zA-Z0-9_()]*)`\s+call(?:s|ed|ing)?\s+`([a-zA-Z_][a-zA-Z0-9_()]*)`/gi,
+      /`([a-zA-Z_][a-zA-Z0-9_()]*)`\s+invok(?:e|es|ed|ing)\s+`([a-zA-Z_][a-zA-Z0-9_()]*)`/gi,
+      /\bcall(?:s|ing|ed)?\s+`([a-zA-Z_][a-zA-Z0-9_()]*)`\s+from\s+`([a-zA-Z0-9_./-]+)`/gi,
+    ],
+    confidence: 0.75,
+  },
+
+  // "X depends on Y", "X requires Y"
+  {
+    relationType: "depends_on",
+    patterns: [
+      /`([a-zA-Z_][a-zA-Z0-9_./-]*)`\s+depends?\s+on\s+`([a-zA-Z_][a-zA-Z0-9_./-]*)`/gi,
+      /`([a-zA-Z_][a-zA-Z0-9_./-]*)`\s+requires?\s+`([a-zA-Z_][a-zA-Z0-9_./-]*)`/gi,
+      /\bdepends?\s+on\s+`?([a-zA-Z_][a-zA-Z0-9_@/.:-]*)`?/gi,
+    ],
+    confidence: 0.8,
+  },
+
+  // "move X to Y", "moved X from Y"
+  {
+    relationType: "moved_to",
+    patterns: [
+      /\bmov(?:e|es|ed|ing)\s+`([^`]+)`\s+to\s+`([^`]+)`/gi,
+      /\bmov(?:e|es|ed|ing)\s+`?([a-zA-Z0-9_./-]+)`?\s+to\s+`?([a-zA-Z0-9_./-]+)`?/gi,
+    ],
+    confidence: 0.8,
+  },
+
+  // "copy X to Y"
+  {
+    relationType: "copied_to",
+    patterns: [
+      /\bcop(?:y|ies|ied|ying)\s+`([^`]+)`\s+to\s+`([^`]+)`/gi,
+      /\bcop(?:y|ies|ied|ying)\s+`?([a-zA-Z0-9_./-]+)`?\s+to\s+`?([a-zA-Z0-9_./-]+)`?/gi,
+    ],
+    confidence: 0.75,
+  },
+
+  // "X returns Y", "X outputs Y"
+  {
+    relationType: "returns",
+    patterns: [
+      /`([a-zA-Z_][a-zA-Z0-9_()]*)`\s+returns?\s+`([a-zA-Z_][a-zA-Z0-9_<>[\]]*)`/gi,
+      /`([a-zA-Z_][a-zA-Z0-9_()]*)`\s+outputs?\s+`([a-zA-Z_][a-zA-Z0-9_<>[\]]*)`/gi,
+    ],
+    confidence: 0.7,
+  },
+
+  // "X accepts Y", "X takes Y as parameter"
+  {
+    relationType: "accepts",
+    patterns: [
+      /`([a-zA-Z_][a-zA-Z0-9_()]*)`\s+accepts?\s+`([a-zA-Z_][a-zA-Z0-9_<>[\]]*)`/gi,
+      /`([a-zA-Z_][a-zA-Z0-9_()]*)`\s+takes?\s+`([a-zA-Z_][a-zA-Z0-9_<>[\]]*)`/gi,
+    ],
+    confidence: 0.7,
+  },
+
+  // "store X in Y", "save X to Y"
+  {
+    relationType: "stores_in",
+    patterns: [
+      /\bstor(?:e|es|ed|ing)\s+`([^`]+)`\s+(?:in|into)\s+`([^`]+)`/gi,
+      /\bsav(?:e|es|ed|ing)\s+`([^`]+)`\s+(?:to|in|into)\s+`([^`]+)`/gi,
+      /\bstor(?:e|es|ed|ing)\s+`?([a-zA-Z0-9_./-]+)`?\s+(?:in|into)\s+`?([a-zA-Z0-9_./-]+)`?/gi,
+    ],
+    confidence: 0.75,
+  },
+
+  // "read X from Y", "load X from Y", "get X from Y"
+  {
+    relationType: "reads_from",
+    patterns: [
+      /\bread(?:s|ing)?\s+`([^`]+)`\s+from\s+`([^`]+)`/gi,
+      /\bload(?:s|ed|ing)?\s+`([^`]+)`\s+from\s+`([^`]+)`/gi,
+      /\bget(?:s|ting)?\s+`([^`]+)`\s+from\s+`([^`]+)`/gi,
+      /\bfetch(?:es|ed|ing)?\s+`([^`]+)`\s+from\s+`([^`]+)`/gi,
+    ],
+    confidence: 0.75,
+  },
+
+  // "write X to Y"
+  {
+    relationType: "writes_to",
+    patterns: [
+      /\bwrit(?:e|es|ing|ten)\s+`([^`]+)`\s+to\s+`([^`]+)`/gi,
+      /\bwrit(?:e|es|ing|ten)\s+`?([a-zA-Z0-9_./-]+)`?\s+to\s+`?([a-zA-Z0-9_./-]+)`?/gi,
+    ],
+    confidence: 0.75,
+  },
+
+  // "update X in Y", "modify X in Y", "fix X in Y"
+  {
+    relationType: "modifies_in",
+    patterns: [
+      /\bupdat(?:e|es|ing|ed)\s+`([^`]+)`\s+in\s+`([^`]+)`/gi,
+      /\bmodif(?:y|ies|ying|ied)\s+`([^`]+)`\s+in\s+`([^`]+)`/gi,
+      /\bfix(?:es|ed|ing)?\s+`([^`]+)`\s+in\s+`([^`]+)`/gi,
+      /\bchang(?:e|es|ing|ed)\s+`([^`]+)`\s+in\s+`([^`]+)`/gi,
+    ],
+    confidence: 0.8,
+  },
+
+  // "delete X from Y", "remove X from Y"
+  {
+    relationType: "deleted_from",
+    patterns: [
+      /\bdelet(?:e|es|ing|ed)\s+`([^`]+)`\s+from\s+`([^`]+)`/gi,
+      /\bremov(?:e|es|ing|ed)\s+`([^`]+)`\s+from\s+`([^`]+)`/gi,
+    ],
+    confidence: 0.8,
+  },
+
+  // "implement X in Y", "create X in Y"
+  {
+    relationType: "implemented_in",
+    patterns: [
+      /\bimplement(?:s|ed|ing)?\s+`([^`]+)`\s+in\s+`([^`]+)`/gi,
+      /\bcreat(?:e|es|ing|ed)\s+`([^`]+)`\s+in\s+`([^`]+)`/gi,
+    ],
+    confidence: 0.8,
+  },
+
+  // "extract X from Y", "pull X from Y"
+  {
+    relationType: "extracted_from",
+    patterns: [
+      /\bextract(?:s|ed|ing)?\s+`([^`]+)`\s+from\s+`([^`]+)`/gi,
+      /\bpull(?:s|ed|ing)?\s+`([^`]+)`\s+from\s+`([^`]+)`/gi,
+    ],
+    confidence: 0.75,
+  },
+
+  // "merge X into Y", "combine X with Y"
+  {
+    relationType: "merged_into",
+    patterns: [
+      /\bmerg(?:e|es|ed|ing)\s+`([^`]+)`\s+into\s+`([^`]+)`/gi,
+      /\bcombin(?:e|es|ed|ing)\s+`([^`]+)`\s+with\s+`([^`]+)`/gi,
+    ],
+    confidence: 0.75,
+  },
+
+  // === SINGLE-CAPTURE PATTERNS (fallback) ===
+  {
+    relationType: "calls",
+    patterns: [
+      /\bcall(?:s|ing|ed)?\s+`?([a-zA-Z_][a-zA-Z0-9_()]*)`?/gi,
+    ],
+    confidence: 0.6,
+  },
+  {
+    relationType: "reads",
+    patterns: [
+      /\bread(?:s|ing)?\s+(?:from\s+)?`?([a-zA-Z0-9_./-]+\.[a-z]{2,4})`?/gi,
+    ],
+    confidence: 0.55,
+  },
+  {
+    relationType: "writes",
+    patterns: [
+      /\bwrit(?:e|es|ing|ten)\s+(?:to\s+)?`?([a-zA-Z0-9_./-]+\.[a-z]{2,4})`?/gi,
+    ],
+    confidence: 0.55,
+  },
+  {
+    relationType: "creates",
+    patterns: [
+      /\bcreat(?:e|es|ing|ed)\s+`([a-zA-Z0-9_./-]+)`/gi,
+      /\bcreat(?:e|es|ing|ed)\s+`?([a-zA-Z0-9_./-]+\.[a-z]{2,4})`?/gi,
+    ],
+    confidence: 0.6,
+  },
+  {
+    relationType: "modifies",
+    patterns: [
+      /\bmodif(?:y|ies|ying|ied)\s+`?([a-zA-Z0-9_./-]+\.[a-z]{2,4})`?/gi,
+      /\bupdat(?:e|es|ing|ed)\s+(?:the\s+)?`([a-zA-Z0-9_./-]+)`/gi,
+      /\bchang(?:e|es|ing|ed)\s+`?([a-zA-Z0-9_./-]+\.[a-z]{2,4})`?/gi,
+      /\bfix(?:es|ed|ing)?\s+(?:the\s+)?`([a-zA-Z0-9_./-]+)`/gi,
+      /\bedit(?:s|ed|ing)?\s+`?([a-zA-Z0-9_./-]+\.[a-z]{2,4})`?/gi,
+    ],
+    confidence: 0.6,
+  },
+  {
+    relationType: "deletes",
+    patterns: [
+      /\bdelet(?:e|es|ing|ed)\s+`?([a-zA-Z0-9_./-]+)`?/gi,
+      /\bremov(?:e|es|ing|ed)\s+`?([a-zA-Z0-9_./-]+)`?/gi,
+    ],
+    confidence: 0.55,
+  },
+  {
+    relationType: "implements",
+    patterns: [
+      /\bimplement(?:s|ed|ing)?\s+`?([a-zA-Z_][a-zA-Z0-9_]*)`?/gi,
+    ],
+    confidence: 0.6,
   },
 ];
 
@@ -490,10 +800,110 @@ export function extractEntities(text: string): ExtractedEntity[] {
   return deduplicateEntities(entities);
 }
 
+function extractRelations(
+  text: string,
+  entities: ExtractedEntity[],
+): ExtractedRelation[] {
+  const relations: ExtractedRelation[] = [];
+  const entityByName = new Map<string, ExtractedEntity>();
+
+  for (const entity of entities) {
+    entityByName.set(entity.name.toLowerCase(), entity);
+  }
+
+  const findEntity = (name: string): ExtractedEntity | undefined => {
+    const normalized = name.toLowerCase();
+    if (entityByName.has(normalized)) {
+      return entityByName.get(normalized);
+    }
+    for (const [key, entity] of entityByName) {
+      if (key.includes(normalized) || normalized.includes(key)) {
+        return entity;
+      }
+    }
+    return undefined;
+  };
+
+  for (const pattern of RELATION_PATTERNS) {
+    for (const regex of pattern.patterns) {
+      const clonedRegex = new RegExp(regex.source, regex.flags);
+      let match: RegExpExecArray | null;
+
+      while ((match = clonedRegex.exec(text)) !== null) {
+        const captured = match.slice(1).filter(Boolean);
+        if (captured.length === 0) continue;
+
+        if (captured.length === 1) {
+          const targetEntity = findEntity(captured[0]);
+          if (targetEntity && !isCommonWord(captured[0], targetEntity.type)) {
+            const contextEntity: ExtractedEntity = {
+              name: "context",
+              type: "concept",
+              context: extractContext(text, match, 50),
+              confidence: 0.5,
+            };
+            relations.push({
+              sourceEntity: contextEntity,
+              targetEntity,
+              relationType: pattern.relationType,
+              confidence: pattern.confidence * 0.8,
+            });
+          }
+        } else if (captured.length >= 2) {
+          const sourceEntity = findEntity(captured[0]);
+          const targetEntity = findEntity(captured[1]);
+
+          if (sourceEntity && targetEntity) {
+            relations.push({
+              sourceEntity,
+              targetEntity,
+              relationType: pattern.relationType,
+              confidence: pattern.confidence,
+            });
+          } else if (targetEntity && !isCommonWord(captured[0], "class")) {
+            const implicitSource: ExtractedEntity = {
+              name: captured[0],
+              type: "class",
+              context: extractContext(text, match, 50),
+              confidence: 0.6,
+            };
+            relations.push({
+              sourceEntity: implicitSource,
+              targetEntity,
+              relationType: pattern.relationType,
+              confidence: pattern.confidence * 0.7,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  return deduplicateRelations(relations);
+}
+
+function deduplicateRelations(
+  relations: ExtractedRelation[],
+): ExtractedRelation[] {
+  const seen = new Map<string, ExtractedRelation>();
+
+  for (const rel of relations) {
+    const key = `${rel.sourceEntity.name}:${rel.relationType}:${rel.targetEntity.name}`;
+    const existing = seen.get(key);
+
+    if (!existing || rel.confidence > existing.confidence) {
+      seen.set(key, rel);
+    }
+  }
+
+  return Array.from(seen.values());
+}
+
 export function extractEntitiesAndRelations(text: string): {
   entities: ExtractedEntity[];
   relations: ExtractedRelation[];
 } {
   const entities = extractEntities(text);
-  return { entities, relations: [] };
+  const relations = extractRelations(text, entities);
+  return { entities, relations };
 }

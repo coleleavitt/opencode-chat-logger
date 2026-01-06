@@ -29,6 +29,7 @@ import {
   getConsolidationStats,
 } from "./consolidation";
 import { extractFactsWithContext, checkFactSupersession } from "./facts";
+import { extractAssistantText, isSubstantiveAssistantText } from "./assistant-text";
 
 // ============================================================================
 // Configuration
@@ -368,11 +369,37 @@ function listSessions(
 const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
   const config = loadConfig(input.directory);
   const { logDir, retentionDays, enableEventLog, maxToolOutputLength } = config;
+  const pluginDirectory = input.directory;
 
   const sessionsDir = path.join(logDir, "sessions");
   const eventsDir = path.join(logDir, "events");
 
   const sessionMetadataCache = new Map<string, SessionMetadata>();
+
+  // Track current session for hooks that don't receive sessionID
+  let currentSessionID: string | null = null;
+
+  let activeMemoryCreations = 0;
+  const MAX_CONCURRENT_MEMORY_CREATIONS = 3;
+  const memoryQueue: Array<() => Promise<void>> = [];
+
+  const processMemoryQueue = async () => {
+    while (memoryQueue.length > 0 && activeMemoryCreations < MAX_CONCURRENT_MEMORY_CREATIONS) {
+      const task = memoryQueue.shift();
+      if (task) {
+        activeMemoryCreations++;
+        task().finally(() => {
+          activeMemoryCreations--;
+          processMemoryQueue();
+        });
+      }
+    }
+  };
+
+  const queueMemoryCreation = (fn: () => Promise<void>) => {
+    memoryQueue.push(fn);
+    processMemoryQueue();
+  };
 
   const db = new ChatLoggerDb(logDir);
 
@@ -488,8 +515,9 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
     } catch {}
 
     try {
-      const { entities } = extractEntitiesAndRelations(content);
+      const { entities, relations } = extractEntitiesAndRelations(content);
       const entityIds: string[] = [];
+      const entityNameToId = new Map<string, string>();
 
       for (const entity of entities) {
         const entityId = crypto.randomUUID();
@@ -503,6 +531,7 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
         const existing = db.getEntityByName(entity.name, entity.type);
         if (existing) {
           entityIds.push(existing.id);
+          entityNameToId.set(entity.name.toLowerCase(), existing.id);
           db.insertEntityMention({
             entity_id: existing.id,
             memory_id: memoryId,
@@ -528,6 +557,24 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
       for (let i = 0; i < entityIds.length; i++) {
         for (let j = i + 1; j < entityIds.length; j++) {
           db.upsertEntityCooccurrence(entityIds[i], entityIds[j], memoryId);
+        }
+      }
+
+      for (const relation of relations) {
+        const sourceId = entityNameToId.get(
+          relation.sourceEntity.name.toLowerCase(),
+        );
+        const targetId = entityNameToId.get(
+          relation.targetEntity.name.toLowerCase(),
+        );
+
+        if (sourceId && targetId && sourceId !== targetId) {
+          db.upsertEntityRelation({
+            source_entity_id: sourceId,
+            target_entity_id: targetId,
+            relation_type: relation.relationType,
+            weight: relation.confidence,
+          });
         }
       }
 
@@ -1708,6 +1755,7 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
             `- **Waypoints**: ${stats.waypoints}\n\n` +
             `### Advanced Features\n` +
             `- **Entities**: ${stats.entities}\n` +
+            `- **Entity Co-occurrences**: ${stats.entityCooccurrences}\n` +
             `- **Entity Relations**: ${stats.entityRelations}\n` +
             `- **Facts**: ${stats.facts}\n` +
             `- **Consolidations**: ${stats.consolidations}\n\n` +
@@ -1980,6 +2028,8 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
       const { message, parts } = output;
       const sessionDir = ensureSessionDir(sessionID);
 
+      currentSessionID = sessionID;
+
       const contentStr = parts
         .filter((p) => p.type === "text" && "text" in p)
         .map((p) => (p as { text: string }).text)
@@ -2005,6 +2055,12 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
         messageCount: (cached?.messageCount || 0) + 1,
       });
 
+      db.upsertSession({
+        id: sessionID,
+        directory: pluginDirectory,
+        last_agent: agent,
+        last_model: modelStr,
+      });
       db.insertMessage({
         id: messageID ?? crypto.randomUUID(),
         session_id: sessionID,
@@ -2015,20 +2071,29 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
         parts_json: parts ? JSON.stringify(parts) : null,
         embedding: null,
       });
-      db.upsertSession({
-        id: sessionID,
-        last_agent: agent,
-        last_model: modelStr,
-      });
       db.incrementMessageCount(sessionID);
 
-      if (message.role === "user" && contentStr.trim().length >= 3) {
+      const role = message.role as string;
+      if (role === "user" && contentStr.trim().length >= 3) {
         const toolCount = parts.filter((p) => p.type === "tool").length;
-        createMemoryFromContent(sessionID, contentStr, {
-          isUserMessage: true,
-          hasCodeBlock: contentStr.includes("```"),
-          toolCount,
-        }).catch(() => {});
+        queueMemoryCreation(() =>
+          createMemoryFromContent(sessionID, contentStr, {
+            isUserMessage: true,
+            hasCodeBlock: contentStr.includes("```"),
+            toolCount,
+          }).then(() => {})
+        );
+      } else if (role === "assistant") {
+        const assistantText = extractAssistantText(parts);
+        if (isSubstantiveAssistantText(assistantText)) {
+          queueMemoryCreation(() =>
+            createMemoryFromContent(sessionID, assistantText, {
+              isUserMessage: false,
+              hasCodeBlock: false,
+              toolCount: parts.filter((p) => p.type === "tool").length,
+            }).then(() => {})
+          );
+        }
       }
     },
 
@@ -2125,10 +2190,12 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
           .join(" | ");
 
         if (sessionSummary.length > 100) {
-          await createMemoryFromContent(sessionID, sessionSummary, {
-            isUserMessage: true,
-            hasCodeBlock: sessionSummary.includes("```"),
-          });
+          queueMemoryCreation(() =>
+            createMemoryFromContent(sessionID, sessionSummary, {
+              isUserMessage: true,
+              hasCodeBlock: sessionSummary.includes("```"),
+            }).then(() => {})
+          );
         }
 
         db.updateSessionSummary(
@@ -2137,6 +2204,86 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
         );
 
         runSessionEndConsolidation(db);
+      } catch {}
+    },
+
+    "experimental.chat.messages.transform": async (_input, output) => {
+      const seenMessageIds = new Set<string>();
+      
+      for (const msg of output.messages) {
+        if (msg.info.role !== "assistant") continue;
+        if (seenMessageIds.has(msg.info.id)) continue;
+        
+        seenMessageIds.add(msg.info.id);
+        
+        const sessionID = (msg.info as { sessionID?: string }).sessionID;
+        if (!sessionID) continue;
+        
+        const existingMsg = db.getMessage(msg.info.id);
+        if (existingMsg) continue;
+        
+        const textParts = msg.parts.filter((p: { type: string }) => p.type === "text");
+        const contentStr = textParts
+          .map((p) => (p as { text?: string }).text || "")
+          .join("\n");
+        
+        if (contentStr.trim().length < 10) continue;
+        
+        db.insertMessage({
+          id: msg.info.id,
+          session_id: sessionID,
+          role: "assistant",
+          content: contentStr,
+          agent: null,
+          model: null,
+          parts_json: JSON.stringify(msg.parts),
+          embedding: null,
+        });
+        
+        const assistantText = extractAssistantText(msg.parts as Array<{ type: string; text?: string }>);
+        if (isSubstantiveAssistantText(assistantText)) {
+          queueMemoryCreation(() =>
+            createMemoryFromContent(sessionID, assistantText, {
+              isUserMessage: false,
+              hasCodeBlock: false,
+              toolCount: msg.parts.filter((p: { type: string }) => p.type === "tool-invocation").length,
+            }).then(() => {})
+          );
+        }
+      }
+    },
+
+    "experimental.chat.system.transform": async (_input, output) => {
+      if (!currentSessionID) return;
+
+      try {
+        const session = db.getSession(currentSessionID);
+        if (!session) return;
+
+        const messages = db.getSessionMessages(currentSessionID);
+        const recentContent = messages
+          .slice(-5)
+          .map((m) => m.content)
+          .join("\n");
+
+        if (recentContent.length < 50) return;
+
+        const emb = await getEmbedder();
+        const relevantMemories = await searchMemories(db, emb, recentContent, {
+          limit: 5,
+          minSimilarity: 0.35,
+          minSalience: 0.03,
+        });
+
+        if (relevantMemories.length === 0) return;
+
+        reinforceRetrievedMemories(db, relevantMemories, 0.05);
+
+        const contextStr = formatMemoriesForContext(relevantMemories, 2000);
+
+        output.system.push(
+          "[Recalled Memory Context]\n\n" + contextStr,
+        );
       } catch {}
     },
   };
