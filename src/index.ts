@@ -2048,13 +2048,6 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
         parts,
       });
 
-      const cached = sessionMetadataCache.get(sessionID);
-      updateSessionMetadata(sessionID, {
-        lastAgent: agent,
-        lastModel: modelStr,
-        messageCount: (cached?.messageCount || 0) + 1,
-      });
-
       db.upsertSession({
         id: sessionID,
         directory: pluginDirectory,
@@ -2072,6 +2065,13 @@ const chatLogger: Plugin = async (input: PluginInput): Promise<Hooks> => {
         embedding: null,
       });
       db.incrementMessageCount(sessionID);
+
+      const dbSession = db.getSession(sessionID);
+      updateSessionMetadata(sessionID, {
+        lastAgent: agent,
+        lastModel: modelStr,
+        messageCount: dbSession?.message_count || 1,
+      });
 
       const role = message.role as string;
       if (role === "user" && contentStr.trim().length >= 3) {
